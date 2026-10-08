@@ -1,0 +1,18 @@
+[Unit]
+Description=lookfocus: focus the Hyprland monitor you are facing
+Documentation=https://github.com/sasukevibes/lookfocus
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lookfocus run
+Restart=on-failure
+RestartSec=5
+# 78 means a problem a restart cannot fix, such as no calibration yet.
+RestartPreventExitStatus=78
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,23 @@
+[package]
+name = "lookfocus"
+version = "0.1.0"
+edition = "2024"
+description = "Switch Hyprland monitor focus by where you are facing, using a webcam"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sasukevibes/lookfocus"
+rust-version = "1.88"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+env_logger = "0.11.11"
+log = "0.4.34"
+nalgebra = "0.35.0"
+# ort is still a release candidate, so pin it exactly. load-dynamic uses the
+# system libonnxruntime (Arch: onnxruntime-cpu) instead of downloading one.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+toml = "1.1.7"
+v4l = "0.14.0"

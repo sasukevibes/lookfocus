@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Arch, to match what lookfocus targets. Tests need no camera, models,
+    # ONNX Runtime or Hyprland.
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain
+        run: |
+          pacman -Syu --noconfirm --needed rustup clang git
+          rustup default stable
+          rustup component add clippy rustfmt
+      - uses: actions/checkout@v7
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Shellcheck
+        run: shellcheck scripts/*.sh
+      - name: PKGBUILD syntax
+        run: bash -n packaging/aur/PKGBUILD

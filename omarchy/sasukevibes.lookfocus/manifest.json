@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "sasukevibes.lookfocus",
+  "name": "lookfocus",
+  "version": "0.1.0",
+  "author": "sasukevibes",
+  "description": "Bar button for lookfocus, which focuses the monitor you are facing. Click to pause or resume, right-click for adaptive centroids, recalibration and the service.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "lookfocus",
+    "description": "Pause, resume and configure head-tracked monitor focus.",
+    "category": "System",
+    "aliases": ["look", "focus", "head", "camera", "monitor", "gaze"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
