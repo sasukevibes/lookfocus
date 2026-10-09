@@ -1,4 +1,5 @@
-//! Face detection and landmark tracking.
+//! Face detection and landmark tracking. Hands work the same way and live in
+//! `hand.rs`.
 //!
 //! Like MediaPipe's video mode, the detector only runs when there is no face
 //! being tracked. Once the landmark model finds a face, its landmarks give the
@@ -9,12 +10,15 @@
 //! fakes, without model files or a camera.
 
 pub mod detector;
+pub mod hand;
+pub mod palm;
 pub mod roi;
 
 use anyhow::Result;
 
 use crate::image::RgbImage;
 use detector::{Detection, LEFT_EYE, RIGHT_EYE};
+pub use hand::{Hand, HandLandmarker, HandOutput, HandTracker, PalmDetector};
 pub use roi::Roi;
 
 /// Side length of the landmark model's square input.
@@ -131,10 +135,16 @@ pub fn roi_from_landmarks(points: &[[f32; 3]]) -> Roi {
     Roi::from_box_and_eyes(x0, y0, x1, y1, eye(RIGHT_EYE_OUTER), eye(LEFT_EYE_OUTER))
 }
 
-/// Maps landmarks from crop pixels back to frame pixels. Depth is scaled by
-/// the crop width so it stays in the same units as x and y.
+/// Maps face landmarks from crop pixels back to frame pixels.
 pub fn project_landmarks(points: &[[f32; 3]], roi: &Roi) -> Vec<[f32; 3]> {
-    let size = MESH_INPUT_SIZE as f32;
+    project(points, roi, MESH_INPUT_SIZE)
+}
+
+/// Maps landmarks from the pixels of a model input `input_size` wide back to
+/// frame pixels. Depth is scaled by the crop width so it stays in the same
+/// units as x and y.
+pub fn project(points: &[[f32; 3]], roi: &Roi, input_size: usize) -> Vec<[f32; 3]> {
+    let size = input_size as f32;
     points
         .iter()
         .map(|p| {

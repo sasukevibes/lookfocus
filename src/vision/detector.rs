@@ -1,17 +1,30 @@
-//! BlazeFace short-range face detection: anchors, decoding and merging.
+//! SSD-style detection as MediaPipe does it: anchors, decoding and merging.
 //!
-//! The model looks at a 128x128 letterboxed copy of the frame and scores 896
-//! fixed anchor boxes. Each anchor also regresses a box and six keypoints. The
-//! numbers here come from MediaPipe's face_detection_short_range graph:
-//! strides 8, 16, 16, 16, two anchors per cell, scales fixed to 1, and a
-//! weighted non-maximum suppression at IoU 0.3.
+//! BlazeFace short-range (faces) and the palm detector (hands) work the same
+//! way. The model looks at a letterboxed square copy of the frame and scores a
+//! fixed grid of anchors. Each anchor also regresses a box and some keypoints,
+//! as offsets in input pixels. Both models use strides 8, 16, 16, 16 with two
+//! anchors per layer per cell, scales fixed to 1, a minimum score of 0.5 and a
+//! weighted non-maximum suppression at IoU 0.3. They differ only in input size
+//! and keypoint count.
+//!
+//! The face numbers live here. The palm numbers are in `palm.rs`.
 
+/// Face detector input side in pixels.
 pub const INPUT_SIZE: usize = 128;
 pub const NUM_ANCHORS: usize = 896;
-pub const NUM_COORDS: usize = 16;
+/// Face detector keypoints per detection.
+pub const NUM_KEYPOINTS: usize = 6;
+pub const NUM_COORDS: usize = 4 + 2 * NUM_KEYPOINTS;
 pub const MIN_SCORE: f32 = 0.5;
 const NMS_IOU: f32 = 0.3;
 const SCORE_CLIP: f32 = 100.0;
+
+/// Anchor layers as (stride, anchors per cell). Layers that share a stride
+/// are merged, each adding two anchors per cell (one for the layer's scale
+/// and one interpolated), so stride 8 gives two anchors per cell and the
+/// three stride-16 layers give six. Faces and palms both use this.
+pub const ANCHOR_LAYERS: [(usize, usize); 2] = [(8, 2), (16, 6)];
 
 /// Keypoint order in BlazeFace output.
 pub const RIGHT_EYE: usize = 0;
@@ -24,14 +37,17 @@ pub struct Anchor {
     pub cy: f32,
 }
 
-/// Generates the 896 SSD anchors for the short-range model.
+/// Generates the 896 SSD anchors for the short-range face model.
 pub fn anchors() -> Vec<Anchor> {
-    // Layers that share a stride are merged, each adding two anchors per cell
-    // (one for the layer's scale and one interpolated), so stride 8 gives two
-    // anchors per cell and the three stride-16 layers give six.
-    let mut out = Vec::with_capacity(NUM_ANCHORS);
-    for (stride, per_cell) in [(8usize, 2usize), (16, 6)] {
-        let cells = INPUT_SIZE / stride;
+    ssd_anchors(INPUT_SIZE, &ANCHOR_LAYERS)
+}
+
+/// Generates anchors for a square input of `input_size` pixels, layer by
+/// layer, then row by row, then cell by cell.
+pub fn ssd_anchors(input_size: usize, layers: &[(usize, usize)]) -> Vec<Anchor> {
+    let mut out = Vec::new();
+    for &(stride, per_cell) in layers {
+        let cells = input_size / stride;
         for y in 0..cells {
             for x in 0..cells {
                 for _ in 0..per_cell {
@@ -43,19 +59,20 @@ pub fn anchors() -> Vec<Anchor> {
     out
 }
 
-/// A detected face in normalized coordinates of the original frame (0 to 1).
+/// A detection in normalized coordinates of the original frame (0 to 1), with
+/// `K` keypoints: six for a face, seven for a palm.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Detection {
+pub struct Detection<const K: usize = NUM_KEYPOINTS> {
     pub score: f32,
     pub xmin: f32,
     pub ymin: f32,
     pub xmax: f32,
     pub ymax: f32,
-    pub keypoints: [[f32; 2]; 6],
+    pub keypoints: [[f32; 2]; K],
 }
 
-impl Detection {
-    fn iou(&self, other: &Detection) -> f32 {
+impl<const K: usize> Detection<K> {
+    fn iou(&self, other: &Self) -> f32 {
         let ix = (self.xmax.min(other.xmax) - self.xmin.max(other.xmin)).max(0.0);
         let iy = (self.ymax.min(other.ymax) - self.ymin.max(other.ymin)).max(0.0);
         let inter = ix * iy;
@@ -94,23 +111,32 @@ impl Letterbox {
 
 /// Turns raw model output into merged detections in frame coordinates.
 ///
-/// `regressors` is 896 x 16 and `scores` is 896 raw logits.
-pub fn decode(regressors: &[f32], scores: &[f32], anchors: &[Anchor], letterbox: Letterbox) -> Vec<Detection> {
-    let size = INPUT_SIZE as f32;
+/// `regressors` holds one row per anchor: box center x, y, width, height,
+/// then x, y for each of the `K` keypoints, all in pixels of an input
+/// `input_size` wide. `scores` holds one raw logit per anchor.
+pub fn decode<const K: usize>(
+    regressors: &[f32],
+    scores: &[f32],
+    anchors: &[Anchor],
+    input_size: usize,
+    letterbox: Letterbox,
+) -> Vec<Detection<K>> {
+    let size = input_size as f32;
+    let coords = 4 + 2 * K;
     let mut raw = Vec::new();
     for (i, a) in anchors.iter().enumerate() {
         let score = sigmoid(scores[i].clamp(-SCORE_CLIP, SCORE_CLIP));
         if score < MIN_SCORE {
             continue;
         }
-        let r = &regressors[i * NUM_COORDS..(i + 1) * NUM_COORDS];
+        let r = &regressors[i * coords..(i + 1) * coords];
         let cx = r[0] / size + a.cx;
         let cy = r[1] / size + a.cy;
         let w = r[2] / size;
         let h = r[3] / size;
         let [xmin, ymin] = letterbox.unpad(cx - w / 2.0, cy - h / 2.0);
         let [xmax, ymax] = letterbox.unpad(cx + w / 2.0, cy + h / 2.0);
-        let mut keypoints = [[0.0; 2]; 6];
+        let mut keypoints = [[0.0; 2]; K];
         for (k, kp) in keypoints.iter_mut().enumerate() {
             *kp = letterbox.unpad(r[4 + 2 * k] / size + a.cx, r[5 + 2 * k] / size + a.cy);
         }
@@ -121,7 +147,7 @@ pub fn decode(regressors: &[f32], scores: &[f32], anchors: &[Anchor], letterbox:
 
 /// MediaPipe's weighted non-maximum suppression: overlapping detections are
 /// averaged by score into the strongest one instead of being dropped.
-pub fn weighted_nms(mut dets: Vec<Detection>) -> Vec<Detection> {
+pub fn weighted_nms<const K: usize>(mut dets: Vec<Detection<K>>) -> Vec<Detection<K>> {
     dets.sort_by(|a, b| b.score.total_cmp(&a.score));
     let mut out = Vec::new();
     while !dets.is_empty() {
@@ -129,13 +155,13 @@ pub fn weighted_nms(mut dets: Vec<Detection>) -> Vec<Detection> {
         let (cluster, rest): (Vec<_>, Vec<_>) = dets.into_iter().partition(|d| d.iou(&top) > NMS_IOU);
         dets = rest;
         let total: f32 = cluster.iter().map(|d| d.score).sum();
-        let avg = |f: &dyn Fn(&Detection) -> f32| cluster.iter().map(|d| f(d) * d.score).sum::<f32>() / total;
+        let avg = |f: &dyn Fn(&Detection<K>) -> f32| cluster.iter().map(|d| f(d) * d.score).sum::<f32>() / total;
         let mut merged = top.clone();
         merged.xmin = avg(&|d| d.xmin);
         merged.ymin = avg(&|d| d.ymin);
         merged.xmax = avg(&|d| d.xmax);
         merged.ymax = avg(&|d| d.ymax);
-        for k in 0..6 {
+        for k in 0..K {
             for c in 0..2 {
                 merged.keypoints[k][c] = avg(&|d| d.keypoints[k][c]);
             }
@@ -186,7 +212,7 @@ mod tests {
         reg[6] = 16.0; // left eye 16 px right
         let (r, s) = one_hit(600, reg, 4.0);
         let none = Letterbox { pad_x: 0.0, pad_y: 0.0 };
-        let d = decode(&r, &s, &a, none);
+        let d: Vec<Detection> = decode(&r, &s, &a, INPUT_SIZE, none);
         assert_eq!(d.len(), 1);
         let d = &d[0];
         let cx = a[600].cx + 0.1;
@@ -200,7 +226,8 @@ mod tests {
     #[test]
     fn drops_low_scores() {
         let (r, s) = one_hit(10, [0.0; NUM_COORDS], -1.0);
-        assert!(decode(&r, &s, &anchors(), Letterbox { pad_x: 0.0, pad_y: 0.0 }).is_empty());
+        let d: Vec<Detection> = decode(&r, &s, &anchors(), INPUT_SIZE, Letterbox { pad_x: 0.0, pad_y: 0.0 });
+        assert!(d.is_empty());
     }
 
     #[test]
@@ -217,7 +244,7 @@ mod tests {
 
     #[test]
     fn nms_merges_overlaps_and_keeps_separate_faces() {
-        let det = |score: f32, x: f32| Detection {
+        let det = |score: f32, x: f32| Detection::<6> {
             score,
             xmin: x,
             ymin: 0.2,

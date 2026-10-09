@@ -1,8 +1,10 @@
 //! Finding the model files and running them with ONNX Runtime.
 //!
-//! Both models are MediaPipe's own (Apache-2.0), converted from the TFLite
-//! files in face_landmarker.task to ONNX. `scripts/fetch-models.sh` downloads
-//! pinned copies and checks their SHA-256.
+//! All models are MediaPipe's own (Apache-2.0), converted to ONNX. The face
+//! models come from the TFLite files in face_landmarker.task. The hand models
+//! are OpenCV Zoo's conversions of MediaPipe's palm detector and hand landmark
+//! model. `scripts/fetch-models.sh` downloads pinned copies and checks their
+//! SHA-256.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -14,10 +16,16 @@ use ort::value::TensorRef;
 
 use crate::image::RgbImage;
 use crate::vision::detector::{self, Anchor, Detection, Letterbox};
-use crate::vision::{FaceDetector, FaceMesh, MESH_INPUT_SIZE, MeshOutput, NUM_LANDMARKS, Roi};
+use crate::vision::hand::{self, HAND_INPUT_SIZE, NUM_HAND_LANDMARKS};
+use crate::vision::palm::{self, PalmDetection};
+use crate::vision::{
+    FaceDetector, FaceMesh, HandLandmarker, HandOutput, MESH_INPUT_SIZE, MeshOutput, NUM_LANDMARKS, PalmDetector, Roi,
+};
 
 pub const DETECTOR_FILE: &str = "face_detector.onnx";
 pub const MESH_FILE: &str = "face_landmarks.onnx";
+pub const HAND_DETECTOR_FILE: &str = "hand_detector.onnx";
+pub const HAND_LANDMARKS_FILE: &str = "hand_landmarks.onnx";
 
 /// Places to look for the model files, most specific first.
 pub fn model_dirs() -> Vec<PathBuf> {
@@ -55,6 +63,12 @@ pub fn find_model_dir(explicit: Option<&Path>) -> Result<PathBuf> {
     )
 }
 
+/// True if `dir` also holds the two hand models. Hand tracking is optional,
+/// so `find_model_dir` only requires the face models.
+pub fn has_hand_models(dir: &Path) -> bool {
+    dir.join(HAND_DETECTOR_FILE).is_file() && dir.join(HAND_LANDMARKS_FILE).is_file()
+}
+
 /// Loads the system ONNX Runtime library. Call once before creating models.
 ///
 /// Uses `ORT_DYLIB_PATH` if set, otherwise the library Arch's
@@ -87,6 +101,25 @@ fn session(path: &Path, threads: usize) -> Result<Session> {
     build().with_context(|| format!("loading model {}", path.display()))
 }
 
+/// Logs each output's name and shape. The hand models' output names have not
+/// been checked against a real file yet, so the code reads them by position
+/// or size, and this log is how to confirm the layout.
+fn log_outputs(session: &Session, path: &Path) {
+    for (i, out) in session.outputs().iter().enumerate() {
+        log::info!("{}: output {i} {:?} {}", path.display(), out.name(), out.dtype());
+    }
+}
+
+/// Fills `input` with a letterboxed copy of the frame: a square region as
+/// large as the longer side, centered, so the frame keeps its aspect ratio
+/// and the rest is black.
+fn letterbox_into(frame: &RgbImage, size: usize, scale: f32, offset: f32, input: &mut [f32]) {
+    let side = frame.width.max(frame.height) as f32;
+    let roi =
+        Roi { cx: frame.width as f32 / 2.0, cy: frame.height as f32 / 2.0, width: side, height: side, angle: 0.0 };
+    roi.crop_into(frame, size, scale, offset, input);
+}
+
 /// BlazeFace short-range detector.
 pub struct OnnxDetector {
     session: Session,
@@ -108,13 +141,8 @@ impl OnnxDetector {
 impl FaceDetector for OnnxDetector {
     fn detect(&mut self, frame: &RgbImage) -> Result<Vec<Detection>> {
         let size = detector::INPUT_SIZE;
-        // Letterbox: a square region as large as the longer side, centered,
-        // so the frame keeps its aspect ratio and the rest is black.
-        let side = frame.width.max(frame.height) as f32;
-        let roi =
-            Roi { cx: frame.width as f32 / 2.0, cy: frame.height as f32 / 2.0, width: side, height: side, angle: 0.0 };
         // The detector expects RGB in [-1, 1].
-        roi.crop_into(frame, size, 2.0 / 255.0, -1.0, &mut self.input);
+        letterbox_into(frame, size, 2.0 / 255.0, -1.0, &mut self.input);
         let outputs =
             self.session.run(ort::inputs![TensorRef::from_array_view(([1usize, size, size, 3], &self.input[..]))?])?;
         let (_, regressors) = outputs["regressors"].try_extract_tensor::<f32>()?;
@@ -122,7 +150,8 @@ impl FaceDetector for OnnxDetector {
         if regressors.len() != detector::NUM_ANCHORS * detector::NUM_COORDS || scores.len() != detector::NUM_ANCHORS {
             bail!("face detector returned unexpected output sizes");
         }
-        Ok(detector::decode(regressors, scores, &self.anchors, Letterbox::for_frame(frame.width, frame.height)))
+        let letterbox = Letterbox::for_frame(frame.width, frame.height);
+        Ok(detector::decode(regressors, scores, &self.anchors, size, letterbox))
     }
 }
 
@@ -157,5 +186,88 @@ impl FaceMesh for OnnxFaceMesh {
         }
         let points = flat.as_chunks::<3>().0.to_vec();
         Ok(MeshOutput { points, presence: detector::sigmoid(presence[0]) })
+    }
+}
+
+/// MediaPipe palm detector (OpenCV Zoo conversion).
+pub struct OnnxPalmDetector {
+    session: Session,
+    anchors: Vec<Anchor>,
+    input: Vec<f32>,
+}
+
+impl OnnxPalmDetector {
+    pub fn load(dir: &Path, threads: usize) -> Result<Self> {
+        let path = dir.join(HAND_DETECTOR_FILE);
+        let session = session(&path, threads)?;
+        log_outputs(&session, &path);
+        let size = palm::INPUT_SIZE;
+        Ok(Self { session, anchors: palm::anchors(), input: vec![0.0; size * size * 3] })
+    }
+}
+
+impl PalmDetector for OnnxPalmDetector {
+    fn detect(&mut self, frame: &RgbImage) -> Result<Vec<PalmDetection>> {
+        let size = palm::INPUT_SIZE;
+        // The palm detector expects RGB in [0, 1].
+        letterbox_into(frame, size, 1.0 / 255.0, 0.0, &mut self.input);
+        let outputs =
+            self.session.run(ort::inputs![TensorRef::from_array_view(([1usize, size, size, 3], &self.input[..]))?])?;
+        // Tell the two outputs apart by size rather than by name: boxes and
+        // keypoints are 2016 x 18, scores are 2016 x 1.
+        let (mut regressors, mut scores) = (None, None);
+        for i in 0..outputs.len() {
+            let (_, data) = outputs[i].try_extract_tensor::<f32>()?;
+            if data.len() == palm::NUM_ANCHORS * palm::NUM_COORDS {
+                regressors = Some(data);
+            } else if data.len() == palm::NUM_ANCHORS {
+                scores = Some(data);
+            }
+        }
+        let (Some(regressors), Some(scores)) = (regressors, scores) else {
+            bail!("palm detector returned unexpected output sizes");
+        };
+        Ok(palm::decode(regressors, scores, &self.anchors, Letterbox::for_frame(frame.width, frame.height)))
+    }
+}
+
+/// MediaPipe hand landmark model (21 points, OpenCV Zoo conversion).
+pub struct OnnxHandLandmarker {
+    session: Session,
+    input: Vec<f32>,
+}
+
+impl OnnxHandLandmarker {
+    pub fn load(dir: &Path, threads: usize) -> Result<Self> {
+        let path = dir.join(HAND_LANDMARKS_FILE);
+        let session = session(&path, threads)?;
+        log_outputs(&session, &path);
+        Ok(Self { session, input: vec![0.0; HAND_INPUT_SIZE * HAND_INPUT_SIZE * 3] })
+    }
+}
+
+impl HandLandmarker for OnnxHandLandmarker {
+    fn run(&mut self, frame: &RgbImage, roi: &Roi) -> Result<HandOutput> {
+        let size = HAND_INPUT_SIZE;
+        // The landmark model expects RGB in [0, 1].
+        roi.crop_into(frame, size, 1.0 / 255.0, 0.0, &mut self.input);
+        let outputs =
+            self.session.run(ort::inputs![TensorRef::from_array_view(([1usize, size, size, 3], &self.input[..]))?])?;
+        // By position: landmarks (21 x 3 in crop pixels), hand confidence,
+        // handedness, then world landmarks, which we do not use.
+        if outputs.len() < 3 {
+            bail!("hand landmark model returned {} outputs, expected at least 3", outputs.len());
+        }
+        let (_, flat) = outputs[0].try_extract_tensor::<f32>()?;
+        let (_, confidence) = outputs[1].try_extract_tensor::<f32>()?;
+        let (_, handedness) = outputs[2].try_extract_tensor::<f32>()?;
+        if flat.len() != NUM_HAND_LANDMARKS * 3 || confidence.is_empty() || handedness.is_empty() {
+            bail!("hand landmark model returned unexpected output sizes");
+        }
+        Ok(HandOutput {
+            points: flat.as_chunks::<3>().0.to_vec(),
+            confidence: hand::as_probability(confidence[0]),
+            handedness: hand::as_probability(handedness[0]),
+        })
     }
 }
