@@ -13,6 +13,7 @@ pub mod control;
 pub mod daemon;
 pub mod events;
 pub mod filter;
+pub mod gesture;
 pub mod hypr;
 pub mod image;
 pub mod models;

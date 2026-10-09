@@ -87,7 +87,7 @@ cd lookfocus
 scripts/install-local.sh
 ```
 
-This builds lookfocus, puts it in `~/.local/bin`, downloads the two models
+This builds lookfocus, puts it in `~/.local/bin`, downloads the models
 (checked against pinned SHA-256 sums), and installs and enables the systemd
 user service. `scripts/uninstall-local.sh` removes all of that again.
 
@@ -282,7 +282,9 @@ to check that head pose can tell monitors apart before the Rust build, and
 The face detection and face mesh models are Google's
 [MediaPipe](https://ai.google.dev/edge/mediapipe) models (Apache-2.0),
 converted to ONNX. The canonical face geometry in `src/pose/canonical.rs`
-comes from the same model bundle.
+comes from the same model bundle. The palm detection and hand landmark models
+are MediaPipe's too, in the ONNX conversions published by
+[OpenCV Zoo](https://github.com/opencv/opencv_zoo) (Apache-2.0).
 
 lookfocus is licensed under either of [MIT](LICENSE-MIT) or
 [Apache-2.0](LICENSE-APACHE), at your option.

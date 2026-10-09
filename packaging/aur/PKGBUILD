@@ -14,16 +14,24 @@ depends=('gcc-libs' 'glibc' 'onnxruntime' 'hyprland')
 makedepends=('cargo' 'clang')
 optdepends=('libnotify: desktop notifications'
             'omarchy: bar widget')
-# The models are MediaPipe's (Apache-2.0), converted to ONNX. They live on a
-# separate release so app releases never change them.
+# The models are MediaPipe's (Apache-2.0), converted to ONNX. The face models
+# live on a separate release so app releases never change them. The hand
+# models are OpenCV Zoo's conversions, not on that release yet, so they come
+# from pinned Hugging Face revisions.
 _models="$url/releases/download/models-v1"
+_hf='https://huggingface.co/opencv'
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "$pkgname-models-v1-face_detector.onnx::$_models/face_detector.onnx"
-        "$pkgname-models-v1-face_landmarks.onnx::$_models/face_landmarks.onnx")
+        "$pkgname-models-v1-face_landmarks.onnx::$_models/face_landmarks.onnx"
+        "$pkgname-hand_detector.onnx::$_hf/palm_detection_mediapipe/resolve/233e619dcea1759bf6de707b9b904fe30881ea55/palm_detection_mediapipe_2023feb.onnx"
+        "$pkgname-hand_landmarks.onnx::$_hf/handpose_estimation_mediapipe/resolve/4b2a0b446e5cf2f11fb6b2c7251091c035d2c1f7/handpose_estimation_mediapipe_2023feb.onnx")
 sha256sums=('SKIP'
             '02a04d5d37c3558dc4d5274f7f8f0f0f01ac94e46c5ffb2cee82395d47e23181'
-            'd16e5a55e6a480284d468ee32469692464049518c311662ab3956681de31e3e9')
-noextract=("$pkgname-models-v1-face_detector.onnx" "$pkgname-models-v1-face_landmarks.onnx")
+            'd16e5a55e6a480284d468ee32469692464049518c311662ab3956681de31e3e9'
+            '78ff51c38496b7fc8b8ebdb6cc8c1abb02fa6c38427c6848254cdaba57fcce7c'
+            'db0898ae717b76b075d9bf563af315b29562e11f8df5027a1ef07b02bef6d81c')
+noextract=("$pkgname-models-v1-face_detector.onnx" "$pkgname-models-v1-face_landmarks.onnx"
+           "$pkgname-hand_detector.onnx" "$pkgname-hand_landmarks.onnx")
 
 prepare() {
   cd "$pkgname-$pkgver"
@@ -49,6 +57,8 @@ package() {
   install -Dm755 target/release/lookfocus "$pkgdir/usr/bin/lookfocus"
   install -Dm644 "$srcdir/$pkgname-models-v1-face_detector.onnx" "$pkgdir/usr/share/lookfocus/models/face_detector.onnx"
   install -Dm644 "$srcdir/$pkgname-models-v1-face_landmarks.onnx" "$pkgdir/usr/share/lookfocus/models/face_landmarks.onnx"
+  install -Dm644 "$srcdir/$pkgname-hand_detector.onnx" "$pkgdir/usr/share/lookfocus/models/hand_detector.onnx"
+  install -Dm644 "$srcdir/$pkgname-hand_landmarks.onnx" "$pkgdir/usr/share/lookfocus/models/hand_landmarks.onnx"
   install -Dm644 packaging/systemd/lookfocus.service "$pkgdir/usr/lib/systemd/user/lookfocus.service"
   install -Dm644 -t "$pkgdir/usr/share/lookfocus/omarchy/sasukevibes.lookfocus" \
     omarchy/sasukevibes.lookfocus/manifest.json omarchy/sasukevibes.lookfocus/BarWidget.qml

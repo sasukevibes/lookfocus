@@ -17,7 +17,8 @@ Two other files are written by lookfocus itself. Do not edit them by hand:
 ## Full example with defaults
 
 ```toml
-# Directory holding face_detector.onnx and face_landmarks.onnx. Unset means
+# Directory holding face_detector.onnx and face_landmarks.onnx (and, for
+# hand tracking, hand_detector.onnx and hand_landmarks.onnx). Unset means
 # the usual places: $LOOKFOCUS_MODEL_DIR, ~/.local/share/lookfocus/models,
 # /usr/share/lookfocus/models.
 # models_dir = "/path/to/models"

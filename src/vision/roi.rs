@@ -1,9 +1,10 @@
-//! Rotated square regions of interest (ROIs) around the face.
+//! Rotated square regions of interest (ROIs) around the face or a hand.
 //!
 //! This follows MediaPipe's face landmarker: the region is rotated so the eyes
 //! sit level, made square on its longer side, and grown by 1.5x so the whole
-//! face fits. The same mapping crops the model input and maps the model's
-//! landmarks back to the full image, so the two always agree.
+//! face fits. Hands work the same way with different numbers (see `hand.rs`).
+//! The same mapping crops the model input and maps the model's landmarks back
+//! to the full image, so the two always agree.
 
 use crate::image::RgbImage;
 
@@ -26,9 +27,19 @@ impl Roi {
     /// Builds the ROI from an axis-aligned box and two reference points (the
     /// eyes), rotating so the line from `a` to `b` becomes horizontal.
     pub fn from_box_and_eyes(x0: f32, y0: f32, x1: f32, y1: f32, a: [f32; 2], b: [f32; 2]) -> Self {
-        let angle = normalize_radians(-(-(b[1] - a[1])).atan2(b[0] - a[0]));
+        let angle = rotation(a, b, 0.0);
         let side = (x1 - x0).max(y1 - y0) * ROI_SCALE;
         Self { cx: (x0 + x1) / 2.0, cy: (y0 + y1) / 2.0, width: side, height: side, angle }
+    }
+
+    /// MediaPipe's rect transformation: moves the center by a fraction of the
+    /// size along the ROI's own (rotated) axes, then makes it square on the
+    /// longer side and scales it. A negative `shift_y` moves toward the top of
+    /// the crop.
+    pub fn transform(&self, shift_x: f32, shift_y: f32, scale: f32) -> Self {
+        let [cx, cy] = self.to_image(0.5 + shift_x, 0.5 + shift_y);
+        let side = self.width.max(self.height) * scale;
+        Self { cx, cy, width: side, height: side, angle: self.angle }
     }
 
     /// Maps a point given in the crop's normalized coordinates (0 to 1 across
@@ -62,6 +73,13 @@ impl Roi {
     }
 }
 
+/// The ROI angle that turns the line from `a` to `b` to point at `target`
+/// once cropped. Angles are counterclockwise as seen on screen: 0 points
+/// right and pi/2 points up.
+pub fn rotation(a: [f32; 2], b: [f32; 2], target: f32) -> f32 {
+    normalize_radians(target - (-(b[1] - a[1])).atan2(b[0] - a[0]))
+}
+
 pub fn normalize_radians(a: f32) -> f32 {
     use std::f32::consts::PI;
     a - 2.0 * PI * ((a + PI) / (2.0 * PI)).floor()
@@ -70,7 +88,7 @@ pub fn normalize_radians(a: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f32::consts::FRAC_PI_4;
+    use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
 
     #[test]
     fn level_eyes_give_an_upright_square() {
@@ -89,6 +107,28 @@ mod tests {
         let a = roi.to_image(0.0, 0.5);
         let b = roi.to_image(1.0, 0.5);
         assert!(((b[1] - a[1]) - (b[0] - a[0])).abs() < 1e-3);
+    }
+
+    #[test]
+    fn transform_shifts_along_the_rotated_axes() {
+        let upright = Roi { cx: 100.0, cy: 100.0, width: 40.0, height: 20.0, angle: 0.0 };
+        let t = upright.transform(0.0, -0.5, 2.0);
+        // Up by half the height, then square on 40 and doubled.
+        assert_eq!((t.cx, t.cy, t.width, t.height), (100.0, 90.0, 80.0, 80.0));
+        // Turned a quarter turn clockwise, the crop's "up" points to image +x.
+        let turned = Roi { angle: FRAC_PI_2, ..upright };
+        let t = turned.transform(0.0, -0.5, 1.0);
+        assert!((t.cx - 110.0).abs() < 1e-4 && (t.cy - 100.0).abs() < 1e-4, "{t:?}");
+        assert_eq!(t.angle, FRAC_PI_2);
+    }
+
+    #[test]
+    fn rotation_points_the_line_at_the_target() {
+        // Wrist below the fingers in the image: already pointing up.
+        assert!(rotation([50.0, 80.0], [50.0, 20.0], FRAC_PI_2).abs() < 1e-6);
+        // Fingers to the right of the wrist: the crop turns a quarter turn
+        // clockwise so its top faces image +x.
+        assert!((rotation([0.0, 0.0], [10.0, 0.0], FRAC_PI_2) - FRAC_PI_2).abs() < 1e-6);
     }
 
     #[test]

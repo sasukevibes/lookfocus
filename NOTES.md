@@ -3,6 +3,33 @@
 A running log of decisions, verified facts, and open questions. Newest phase at
 the top of each section. The project brief is in `docs/SPEC.md`.
 
+## Hand tracking (2026-10-09, not yet run on real models)
+
+Written and tested with fakes only, without network access, so nothing in
+this section has been checked against the model files or a camera yet.
+
+- Models: OpenCV Zoo's ONNX conversions of MediaPipe's palm detector
+  (`opencv/palm_detection_mediapipe@233e619`, saved as `hand_detector.onnx`,
+  sha256 78ff51c3...) and hand landmark model
+  (`opencv/handpose_estimation_mediapipe@4b2a0b4`, saved as
+  `hand_landmarks.onnx`, sha256 db0898ae...). Apache-2.0. They are not on the
+  `models-v1` release yet, so `scripts/fetch-models.sh` and the PKGBUILD fetch
+  them from Hugging Face directly.
+- Palm detector, as expected from OpenCV Zoo's code: input 1x192x192x3 RGB in
+  [0, 1], letterboxed. Outputs 2016 x 18 (box center, size, then 7 keypoints)
+  and 2016 x 1 score logits. Anchors are BlazeFace's scheme at 192 px (stride
+  8 with 2 per cell, stride 16 with 6 per cell). The code tells the outputs
+  apart by size, not by name.
+- Landmark model: input 1x224x224x3 RGB in [0, 1]. Outputs read by position:
+  21 x 3 landmarks in crop pixels, hand confidence, handedness, world
+  landmarks (unused). A score outside [0, 1] is treated as a logit and passed
+  through a sigmoid. Both hand models log their output names and shapes at
+  load, so the first real run confirms or corrects this layout.
+- To check on the first real run: the logged output layout, that an open hand
+  gives landmarks that line up with it, and which side the handedness score
+  means. MediaPipe's hand models assume a mirrored (selfie) image, and
+  lookfocus does not mirror frames.
+
 ## Verified facts (Phases 4 and 5, 2026-10-08)
 
 - Installed on the development machine with `scripts/install-local.sh`:
@@ -305,6 +332,43 @@ The camera is the laptop's integrated UVC camera (`uvcvideo`,
   they opt in.
 
 ## Decisions
+
+### Hand tracking (2026-10-09)
+
+- The SSD anchor, decode and weighted NMS code is shared by faces and palms,
+  generalized over input size and keypoint count.
+- Hand crop from a palm, as MediaPipe does it: turned so the wrist to middle
+  finger line points up, moved half the palm box toward the fingers, squared
+  and grown 2.6x. From landmarks: same turn using the wrist and middle finger
+  knuckle, the box of the steadier landmarks (no fingertips) measured along
+  the turned axes, moved a tenth toward the fingers, squared and doubled.
+- `HandTracker` tracks one hand. Unlike the face tracker, the palm detector
+  runs at most once every 4 frames while no hand is tracked (`detect_every`),
+  because most of the time there is no hand in view and the detector is the
+  expensive part. A hand lost after tracking for a while is looked for again
+  on the same frame.
+- Gestures come from geometry on the 21 landmarks, not a model. A finger is
+  extended when its tip is farther from the wrist than its PIP joint. The
+  thumb also needs its tip farther than its IP joint from the little finger's
+  base, which catches a thumb folded across the palm. Only x and y are used.
+  The open palm (all five extended) is the only gesture so far.
+- The hand models are optional: `find_model_dir` still needs only the face
+  models. `models::load_hand_tracker` returns None without them and logs one
+  warning per process (the daemon reopens the camera after every pause).
+- Wiring: `Sampler` holds an optional hand tracker (`with_hands`), and each
+  `Sample` has `hand: Option<HandSample>` with the gesture, the hand
+  confidence and the handedness score. It is always None without the hand
+  models. Every live sampler (`run`, `calibrate`, `debug`, the record
+  example) gets hands when the models are there.
+- A hand model error at run time logs a warning and turns hand tracking off
+  for that sampler instead of failing the sample. The hand output layout is
+  still unverified, and a wrong guess must not stop focus switching.
+- Nothing acts on gestures yet, and daemon behavior is unchanged. A later
+  branch connects gestures to actions. `Gesture` serializes in snake_case
+  (`open_palm`) so config can name it.
+- Cost to check on the first real run: with no hand in view, the palm
+  detector runs on one frame in four in every live sampler, including the
+  daemon's.
 
 ### Release (2026-10-08)
 
