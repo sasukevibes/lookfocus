@@ -14,10 +14,11 @@ use lookfocus::control::{self, Status};
 use lookfocus::daemon::Daemon;
 use lookfocus::events::Event;
 use lookfocus::filter::PoseFilter;
+use lookfocus::gesture::Gesture;
 use lookfocus::hypr::{Compositor, Hyprland};
 use lookfocus::models::{self, OnnxDetector, OnnxFaceMesh};
 use lookfocus::notify;
-use lookfocus::sampler::{PoseSource, Sampler};
+use lookfocus::sampler::{HandSample, PoseSource, Sampler};
 use lookfocus::state::{State, state_path};
 use lookfocus::switcher::{Decision, SwitchParams, Switcher, auto_hysteresis};
 use lookfocus::vision::FaceTracker;
@@ -61,6 +62,11 @@ enum Command {
         #[arg(value_enum)]
         action: AdaptiveAction,
     },
+    /// Switch hand gestures, which run a command when you hold a hand up.
+    Gestures {
+        #[arg(value_enum)]
+        action: GesturesAction,
+    },
     /// Stream events as JSON lines (experimental).
     Watch,
     /// Show live head pose, the monitor it points at, and what would happen.
@@ -90,6 +96,23 @@ impl AdaptiveAction {
             AdaptiveAction::Off => "off",
             AdaptiveAction::Toggle => "toggle",
             AdaptiveAction::Reset => "reset",
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum GesturesAction {
+    On,
+    Off,
+    Toggle,
+}
+
+impl GesturesAction {
+    fn word(self) -> &'static str {
+        match self {
+            GesturesAction::On => "on",
+            GesturesAction::Off => "off",
+            GesturesAction::Toggle => "toggle",
         }
     }
 }
@@ -139,7 +162,9 @@ fn open_sampler(settings: &Settings, model_dir: &Path) -> Result<LiveSampler> {
     let threads = settings.camera.threads;
     let tracker = FaceTracker::new(OnnxDetector::load(model_dir, threads)?, OnnxFaceMesh::load(model_dir, threads)?);
     let camera = V4lCamera::open(&settings.camera.device, 640, 480, settings.camera.fps)?;
-    Ok(Sampler::new(camera, tracker).with_hands(models::load_hand_tracker(model_dir, threads)))
+    // The hand models load only when hand tracking is switched on.
+    let hand_dir = model_dir.to_path_buf();
+    Ok(Sampler::new(camera, tracker).with_hand_loader(move || models::load_hand_tracker(&hand_dir, threads)))
 }
 
 fn calibration_path() -> PathBuf {
@@ -210,6 +235,8 @@ fn print_status(s: &Status) {
         if s.adaptive { "on" } else { "off" },
         if drift.is_empty() { String::new() } else { format!(" (learned: {})", drift.join(", ")) }
     );
+    let seeing = s.gesture.map(|g| format!(" (seeing {g})")).unwrap_or_default();
+    println!("  gestures {}{seeing}", if s.gestures { "on" } else { "off" });
 }
 
 /// Status when the daemon is not running, so the bar can still show
@@ -230,6 +257,8 @@ fn stopped_status(settings: &Settings) -> Status {
         face: false,
         camera: false,
         adaptive: state.adaptive.unwrap_or(settings.adaptive.enabled),
+        gestures: state.gestures.unwrap_or(settings.gestures.enabled),
+        gesture: None,
         mouse_hold: false,
         drift: Vec::new(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -285,6 +314,26 @@ fn adaptive(settings: &Settings, action: AdaptiveAction) -> Result<()> {
     Ok(())
 }
 
+fn gestures(settings: &Settings, action: GesturesAction) -> Result<()> {
+    if daemon_running() {
+        print_status(&daemon_request(&format!("gestures {}", action.word()))?);
+        return Ok(());
+    }
+    // Not running: change the saved switch so the next start uses it.
+    let path = state_path();
+    let mut state = State::load(&path);
+    let current = state.gestures.unwrap_or(settings.gestures.enabled);
+    let on = match action {
+        GesturesAction::On => true,
+        GesturesAction::Off => false,
+        GesturesAction::Toggle => !current,
+    };
+    state.gestures = Some(on);
+    state.save(&path)?;
+    println!("gestures {} (applies when lookfocus starts)", if on { "on" } else { "off" });
+    Ok(())
+}
+
 fn watch() -> Result<()> {
     let mut out = std::io::stdout().lock();
     control::watch(&control::socket_path(), |line| {
@@ -329,21 +378,44 @@ fn ask_camera_monitor(plan: &Plan, default: usize) -> Result<usize> {
     }
 }
 
-/// Pauses a running daemon so calibration can use the camera. Returns
-/// whether it was tracking before, so it can be resumed afterwards.
-fn borrow_camera_from_daemon() -> Result<Option<bool>> {
+/// What a running daemon was doing before another command borrowed the camera.
+struct Borrowed {
+    tracking: bool,
+    gestures: bool,
+}
+
+/// Pauses a running daemon so calibration can use the camera. Returns what it
+/// was doing before, so it can be given back afterwards.
+fn borrow_camera_from_daemon() -> Result<Option<Borrowed>> {
     let Ok(before) = daemon_request("status") else { return Ok(None) };
-    let was_paused = before.state == "paused";
+    let borrowed = Borrowed { tracking: before.state != "paused", gestures: before.gestures };
     daemon_request("pause")?;
+    if borrowed.gestures {
+        // Gestures keep the camera open while paused, so they stop for now too.
+        daemon_request("gestures off")?;
+    }
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until {
         if !daemon_request("status")?.camera {
             println!("Paused the running lookfocus to use the camera.");
-            return Ok(Some(!was_paused));
+            return Ok(Some(borrowed));
         }
         std::thread::sleep(Duration::from_millis(150));
     }
+    // Do not leave it stopped.
+    give_camera_back(&borrowed)?;
     bail!("the running lookfocus did not release the camera")
+}
+
+/// Undoes `borrow_camera_from_daemon`.
+fn give_camera_back(borrowed: &Borrowed) -> Result<()> {
+    if borrowed.tracking {
+        daemon_request("resume")?;
+    }
+    if borrowed.gestures {
+        daemon_request("gestures on")?;
+    }
+    Ok(())
 }
 
 fn calibrate(settings: &Settings, args: CalibrateArgs, previous_hint: Option<String>) -> Result<()> {
@@ -414,14 +486,16 @@ fn calibrate(settings: &Settings, args: CalibrateArgs, previous_hint: Option<Str
     });
 
     // Hand the camera back, whether or not calibration worked.
-    if let Some(was_tracking) = resume_after {
-        if saved.is_ok() {
-            daemon_request("reload")?;
-            println!("The running lookfocus now uses the new calibration.");
-        }
-        if was_tracking {
-            daemon_request("resume")?;
-        }
+    if let Some(borrowed) = resume_after {
+        let reloaded = if saved.is_ok() {
+            daemon_request("reload").map(|_| println!("The running lookfocus now uses the new calibration."))
+        } else {
+            Ok(())
+        };
+        // Give the camera back even if the reload failed.
+        let returned = give_camera_back(&borrowed);
+        reloaded?;
+        returned?;
     } else if saved.is_ok() {
         println!("Start tracking with `systemctl --user start {SERVICE}` or `lookfocus run`.");
     }
@@ -522,10 +596,19 @@ fn debug(settings: &Settings, seconds: Option<f32>, json: bool) -> Result<()> {
     let model_dir = prepare_models(settings)?;
     let resume_after = borrow_camera_from_daemon()?;
     let result = debug_loop(settings, &model_dir, switcher.as_mut(), seconds, json);
-    if resume_after == Some(true) {
-        daemon_request("resume")?;
+    if let Some(borrowed) = resume_after {
+        give_camera_back(&borrowed)?;
     }
     result
+}
+
+/// The hand in a sample as a few words: none, a gesture with the model's
+/// confidence, or a hand showing no known gesture.
+fn hand_text(hand: Option<&HandSample>) -> String {
+    match hand {
+        None => "none".into(),
+        Some(h) => format!("{} {:.2}", h.gesture.map_or("unknown", Gesture::name), h.confidence),
+    }
 }
 
 fn debug_loop(
@@ -536,6 +619,8 @@ fn debug_loop(
     json: bool,
 ) -> Result<()> {
     let mut sampler = open_sampler(settings, model_dir)?;
+    // Show hands whatever the gestures setting is, to check they work.
+    sampler.set_hands(true);
     let mut filter = PoseFilter::new(settings.filter);
     let start = Instant::now();
     let end = seconds.map(|s| start + Duration::from_secs_f32(s));
@@ -558,9 +643,13 @@ fn debug_loop(
                 sw.hold();
             }
             if json {
-                writeln!(out, r#"{{"t":{t:.3},"face":false,"inference_ms":{:.1}}}"#, ms(s.inference))?;
+                let v = serde_json::json!({
+                    "t": t, "face": false, "hand": s.hand.is_some(), "gesture": s.hand.as_ref().and_then(|h| h.gesture),
+                    "inference_ms": ms(s.inference),
+                });
+                writeln!(out, "{v}")?;
             } else {
-                let line = format!("no face  {fps:4.1} fps");
+                let line = format!("no face  hand {}  {fps:4.1} fps", hand_text(s.hand.as_ref()));
                 if tty { write!(out, "\r{line:<120}")? } else { writeln!(out, "{line}")? }
             }
             out.flush()?;
@@ -589,7 +678,8 @@ fn debug_loop(
             let v = serde_json::json!({
                 "t": t, "face": true, "yaw": f.pose.yaw, "pitch": f.pose.pitch, "yaw_smooth": yaw,
                 "pitch_smooth": pitch, "speed": speed, "zone": zone, "margin": margin, "decision": decision,
-                "luma": f.luma, "inference_ms": ms(s.inference),
+                "luma": f.luma, "hand": s.hand.is_some(), "gesture": s.hand.as_ref().and_then(|h| h.gesture),
+                "inference_ms": ms(s.inference),
             });
             writeln!(out, "{v}")?;
         } else {
@@ -597,6 +687,7 @@ fn debug_loop(
             if let (Some(z), Some(m), Some(d)) = (&zone, margin, &decision) {
                 line.push_str(&format!("  zone {z:<6} margin {m:4.1}  {d}"));
             }
+            line.push_str(&format!("  hand {}", hand_text(s.hand.as_ref())));
             line.push_str(&format!("  {fps:4.1} fps"));
             if tty { write!(out, "\r{line:<120}")? } else { writeln!(out, "{line}")? }
         }
@@ -624,6 +715,7 @@ fn main() -> Result<()> {
         Command::Resume => simple_command("resume", true),
         Command::Status { json } => status(&settings, json),
         Command::Adaptive { action } => adaptive(&settings, action),
+        Command::Gestures { action } => gestures(&settings, action),
         Command::Watch => watch(),
         Command::Debug { seconds, json } => debug(&settings, seconds, json),
     }

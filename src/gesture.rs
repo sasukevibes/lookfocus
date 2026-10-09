@@ -15,7 +15,9 @@
 //! three, and an open palm faces the camera, which puts its fingers across the
 //! image anyway.
 //!
-//! Only the open palm (all five fingers extended) is defined so far.
+//! Only the open palm (all five fingers extended) is defined so far. Acting on
+//! a gesture is not done here: `trigger.rs` decides when one counts, and
+//! `actions.rs` runs the command.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,11 +27,26 @@ use crate::vision::hand::{
 };
 
 /// Config files name gestures in snake_case, for example `open_palm`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Gesture {
     /// All five fingers extended.
     OpenPalm,
+}
+
+impl Gesture {
+    /// The name used in config files, events and status.
+    pub fn name(self) -> &'static str {
+        match self {
+            Gesture::OpenPalm => "open_palm",
+        }
+    }
+}
+
+impl std::fmt::Display for Gesture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// Which fingers are extended.
@@ -171,6 +188,7 @@ mod tests {
     #[test]
     fn gesture_names_are_snake_case() {
         assert_eq!(serde_json::to_string(&Gesture::OpenPalm).unwrap(), "\"open_palm\"");
+        assert_eq!(Gesture::OpenPalm.to_string(), "open_palm");
         assert_eq!(serde_json::from_str::<Gesture>("\"open_palm\"").unwrap(), Gesture::OpenPalm);
         assert!(serde_json::from_str::<Gesture>("\"OpenPalm\"").is_err());
     }

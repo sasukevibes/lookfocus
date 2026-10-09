@@ -1,12 +1,20 @@
 //! The tracking loop: poses in, monitor switches out.
 //!
 //! Each tick checks the mouse, decides whether the camera should be open,
-//! reads one pose if it is, and asks the switcher whether to move focus.
+//! reads one sample if it is, asks the switcher whether to move focus, and
+//! asks the gesture trigger whether a hand gesture just counted.
 //!
-//! The camera is open only while it is useful. It is released when you pause
-//! lookfocus, when the monitor layout no longer matches the calibration, and
-//! when no face has been seen for a while ("away"). While away, moving the
-//! mouse brings tracking back at once, and a short check runs every so often.
+//! The camera is open only while it is useful. Focus tracking and gestures are
+//! separate switches, and either one wants the camera. It is released when
+//! neither is active: tracking is paused or the monitor layout no longer
+//! matches the calibration, and gestures are off. It is also released when no
+//! face has been seen for a while ("away"), whatever the camera was for. While
+//! away, moving the mouse brings it back at once, and a short check runs every
+//! so often.
+//!
+//! While tracking is paused or the layout changed but gestures are on, the
+//! camera stays open for gestures only: no focus switching happens. Hand
+//! tracking, and the hand models, are on only while gestures are.
 //!
 //! Overrides, in the order they apply:
 //!
@@ -14,6 +22,9 @@
 //! 2. Mouse movement holds switching for a moment (2 s by default). While the
 //!    mouse moves on a monitor, the pose also teaches adaptive centroids.
 //! 3. No face, or looking down, holds the current monitor.
+//!
+//! Gestures are not affected by 2 and 3. They have their own rules, in
+//! `trigger.rs`.
 //!
 //! lookfocus never reads the keyboard. Mouse movement is seen only as cursor
 //! position changes reported by Hyprland, ignoring moves lookfocus made.
@@ -28,16 +39,19 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use crate::actions::{ActionRunner, ShellRunner};
 use crate::adaptive::{Adaptive, AdaptiveParams};
 use crate::classify::Classifier;
 use crate::config::{Calibration, CursorMode, Settings};
-use crate::control::{AdaptiveCommand, Command, Request, Status};
+use crate::control::{AdaptiveCommand, Command, GesturesCommand, Request, Status};
 use crate::events::{Event, EventBus};
 use crate::filter::PoseFilter;
+use crate::gesture::Gesture;
 use crate::hypr::{Compositor, HyprEvent, Monitor};
-use crate::sampler::PoseSource;
+use crate::sampler::{HandSample, PoseSource};
 use crate::state::State;
 use crate::switcher::{Decision, SwitchParams, Switcher, auto_hysteresis};
+use crate::trigger::{Trigger, TriggerParams};
 
 /// Opens the pose source (camera plus models). Called again after each
 /// release.
@@ -81,6 +95,13 @@ pub struct Daemon<P, C> {
 
     adaptive: Adaptive,
     adaptive_on: bool,
+    /// Gestures switched on or off at run time. `None` follows the settings.
+    gestures_choice: Option<bool>,
+    trigger: Trigger,
+    runner: Box<dyn ActionRunner>,
+    /// Whether the last sample showed a hand, and the gesture it showed.
+    hand_seen: bool,
+    hand_gesture: Option<Gesture>,
     state_path: Option<PathBuf>,
     /// Where `reload` reads the calibration from.
     pub calibration_path: Option<PathBuf>,
@@ -143,11 +164,13 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
             hysteresis,
             settle_speed: settings.switching.settle_speed,
         };
+        let gestures_on = state.gestures.unwrap_or(settings.gestures.enabled);
         log::info!(
-            "dwell {} ms, hysteresis {hysteresis:.1} degrees, settle speed {} deg/s, adaptive {}",
+            "dwell {} ms, hysteresis {hysteresis:.1} degrees, settle speed {} deg/s, adaptive {}, gestures {}",
             settings.switching.dwell_ms,
             settings.switching.settle_speed,
-            if adaptive_on { "on" } else { "off" }
+            if adaptive_on { "on" } else { "off" },
+            if gestures_on { "on" } else { "off" }
         );
         let look_down =
             if settings.overrides.look_down { calibration.look_down.as_ref().map(|l| l.threshold) } else { None };
@@ -175,6 +198,15 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
             },
             adaptive,
             adaptive_on,
+            gestures_choice: state.gestures,
+            trigger: Trigger::new(TriggerParams {
+                hold: Duration::from_millis(settings.gestures.hold_ms),
+                cooldown: Duration::from_millis(settings.gestures.cooldown_ms),
+                require_face: settings.gestures.require_face,
+            }),
+            runner: Box::new(ShellRunner),
+            hand_seen: false,
+            hand_gesture: None,
             state_path,
             calibration_path: None,
             settings: settings.clone(),
@@ -202,6 +234,12 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         };
         d.refresh_monitors()?;
         Ok(d)
+    }
+
+    /// Replaces the command runner, which starts as the real shell. Tests use
+    /// a fake one.
+    pub fn set_runner(&mut self, runner: Box<dyn ActionRunner>) {
+        self.runner = runner;
     }
 
     /// Announces the calibrated monitors. Call after subscribing to events.
@@ -271,6 +309,8 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
             face: self.face,
             camera: self.source.is_some(),
             adaptive: self.adaptive_on,
+            gestures: self.gestures_on(),
+            gesture: self.hand_gesture,
             mouse_hold: self.mouse_hold_until.is_some_and(|t| now < t),
             drift: names.zip(self.adaptive.drift()).collect(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -299,6 +339,14 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
                         self.apply_centroids();
                         self.state_dirty = true;
                     }
+                }
+                self.save_state();
+            }
+            Command::Gestures(g) => {
+                match g {
+                    GesturesCommand::On => self.set_gestures(true),
+                    GesturesCommand::Off => self.set_gestures(false),
+                    GesturesCommand::Toggle => self.set_gestures(!self.gestures_on()),
                 }
                 self.save_state();
             }
@@ -347,7 +395,12 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         if paused {
             log::info!("paused");
             // Release now, so the camera is free as soon as the reply arrives.
-            self.release_camera();
+            // With gestures on it stays open for them, and only switching stops.
+            if self.gestures_on() {
+                self.stop_switching();
+            } else {
+                self.release_camera();
+            }
             self.save_state();
             self.events.emit(Event::Paused { reason: "paused".into() });
         } else {
@@ -370,6 +423,48 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         }
     }
 
+    fn gestures_on(&self) -> bool {
+        self.gestures_choice.unwrap_or(self.settings.gestures.enabled)
+    }
+
+    /// Whether focus switching is allowed: not paused and the layout matches.
+    fn switching_on(&self) -> bool {
+        !self.user_paused && self.layout_issue.is_none()
+    }
+
+    fn set_gestures(&mut self, on: bool) {
+        if on == self.gestures_on() {
+            return;
+        }
+        self.gestures_choice = Some(on);
+        self.state_dirty = true;
+        log::info!("gestures {}", if on { "on" } else { "off" });
+        if let Some(s) = self.source.as_mut() {
+            s.set_hands(on);
+        }
+        self.forget_hand();
+        if !on && !self.switching_on() {
+            // The camera was open for gestures only.
+            self.release_camera();
+        }
+        self.events.emit(Event::GesturesChanged { enabled: on });
+    }
+
+    /// Drops everything known about the hand and any gesture being held.
+    fn forget_hand(&mut self) {
+        self.trigger.reset();
+        self.hand_seen = false;
+        self.hand_gesture = None;
+    }
+
+    /// Stops focus switching while the camera stays open, as when pausing with
+    /// gestures on. The next tick keeps it stopped.
+    fn stop_switching(&mut self) {
+        self.filter.reset();
+        self.switcher.hold();
+        self.zone = None;
+    }
+
     fn apply_centroids(&mut self) {
         let c = if self.adaptive_on { self.adaptive.centroids().to_vec() } else { self.adaptive.base().to_vec() };
         self.switcher.classifier_mut().set_centroids(c);
@@ -382,6 +477,7 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         }
         let state = State {
             adaptive: Some(self.adaptive_on),
+            gestures: self.gestures_choice,
             calibration: self.calibration.created.clone(),
             learned: Some(self.adaptive.centroids().to_vec()),
         };
@@ -469,6 +565,7 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         self.switcher.hold();
         self.warmup_until = None;
         self.still_since = None;
+        self.forget_hand();
         if self.face {
             self.face = false;
             self.events.emit(Event::FaceLost);
@@ -482,6 +579,7 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         match (self.open)() {
             Ok(mut source) => {
                 source.set_fps(self.timing.fps);
+                source.set_hands(self.gestures_on());
                 self.current_fps = self.timing.fps;
                 self.source = Some(source);
                 self.warmup_until = Some(now + self.timing.warmup);
@@ -520,7 +618,8 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
             self.probe_until = Some(now + self.timing.probe_length);
         }
         let probing = self.probe_until.is_some();
-        let want_camera = !self.user_paused && self.layout_issue.is_none() && (!self.away || probing);
+        // Either focus tracking or gestures wants the camera. Away applies to both.
+        let want_camera = (self.switching_on() || self.gestures_on()) && (!self.away || probing);
 
         if !want_camera {
             self.release_camera();
@@ -549,6 +648,8 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
             return Ok(Tick::Sampled(Decision::Stay));
         }
         self.warmup_until = None;
+
+        self.handle_hand(sample.time, sample.face.is_some(), sample.hand.as_ref());
 
         let Some(face) = sample.face else {
             if self.face {
@@ -581,6 +682,13 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
             self.face = true;
             self.events.emit(Event::FaceFound);
         }
+        if !self.switching_on() {
+            // The camera is open for gestures only.
+            self.stop_switching();
+            self.adjust_rate(now, &Decision::Stay, 0.0);
+            self.save_state_if_due(now);
+            return Ok(Tick::Sampled(Decision::Stay));
+        }
         let t = sample.time.duration_since(self.start).as_secs_f32();
         let (yaw, pitch) = self.filter.filter(t, face.pose.yaw, face.pose.pitch);
         let speed = self.filter.speed();
@@ -597,6 +705,40 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         self.adjust_rate(now, &decision, speed);
         self.save_state_if_due(now);
         Ok(Tick::Sampled(decision))
+    }
+
+    /// Notes what the hand in this sample shows, and runs the gesture's
+    /// command if it has just been held long enough.
+    fn handle_hand(&mut self, time: Instant, face: bool, hand: Option<&HandSample>) {
+        if !self.gestures_on() {
+            return;
+        }
+        self.hand_seen = hand.is_some();
+        self.hand_gesture = hand.and_then(|h| h.gesture);
+        if let Some(gesture) = self.trigger.update(time, self.hand_gesture, face) {
+            self.fire(gesture);
+        }
+    }
+
+    fn fire(&mut self, gesture: Gesture) {
+        let command = self
+            .settings
+            .gestures
+            .actions
+            .get(&gesture)
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
+            .map(str::to_string);
+        match &command {
+            Some(c) => {
+                log::info!("{gesture}: running `{c}`");
+                if let Err(e) = self.runner.run(gesture, c) {
+                    log::warn!("the {gesture} command failed to start: {e:#}");
+                }
+            }
+            None => log::info!("{gesture}: no command set"),
+        }
+        self.events.emit(Event::Gesture { gesture, command });
     }
 
     fn come_back(&mut self, now: Instant) {
@@ -671,9 +813,11 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
     /// Drops to the idle rate while the head is still and nothing is
     /// pending, and goes back to the full rate as soon as anything happens.
     fn adjust_rate(&mut self, now: Instant, decision: &Decision, speed: f32) {
+        // A hand in view may be about to make a gesture, which needs every frame.
         let still = matches!(decision, Decision::Stay)
             && speed < self.switcher.params().settle_speed / 2.0
-            && !self.mouse_hold_until.is_some_and(|t| now < t);
+            && !self.mouse_hold_until.is_some_and(|t| now < t)
+            && !self.hand_seen;
         if still {
             let since = *self.still_since.get_or_insert(now);
             if now.duration_since(since) >= self.timing.idle_after {
@@ -780,11 +924,19 @@ mod tests {
     /// camera continues the script. Each sample advances the fake clock.
     struct Script {
         poses: Vec<Option<(f32, f32)>>,
+        /// What the hand shows at each sample, if hand tracking is on: no hand,
+        /// a hand with no known gesture, or a gesture.
+        hands: Vec<Option<Option<Gesture>>>,
         i: usize,
         clock: Rc<Cell<Instant>>,
         opens: usize,
         fail_open: bool,
         fps: Vec<f32>,
+        /// Whether hand tracking is on now, every change to it, and how many
+        /// samples were read with it on.
+        hands_on: bool,
+        hands_calls: Vec<bool>,
+        hand_samples: usize,
     }
 
     struct Source(Rc<RefCell<Script>>);
@@ -793,6 +945,16 @@ mod tests {
         fn sample(&mut self) -> Result<Sample> {
             let mut s = self.0.borrow_mut();
             let pose = s.poses.get(s.i).copied().flatten();
+            let hand = if s.hands_on {
+                s.hand_samples += 1;
+                s.hands.get(s.i).copied().flatten().map(|gesture| HandSample {
+                    gesture,
+                    confidence: 0.9,
+                    handedness: 0.5,
+                })
+            } else {
+                None
+            };
             s.i += 1;
             let t = s.clock.get() + FRAME;
             s.clock.set(t);
@@ -802,10 +964,32 @@ mod tests {
                 tracked: true,
                 luma: 100.0,
             });
-            Ok(Sample { time: t, face, hand: None, capture: Duration::ZERO, inference: Duration::ZERO })
+            Ok(Sample { time: t, face, hand, capture: Duration::ZERO, inference: Duration::ZERO })
         }
         fn set_fps(&mut self, fps: f32) {
             self.0.borrow_mut().fps.push(fps);
+        }
+        fn set_hands(&mut self, on: bool) {
+            let mut s = self.0.borrow_mut();
+            s.hands_on = on;
+            s.hands_calls.push(on);
+        }
+    }
+
+    /// A command runner that records what it was asked to run.
+    #[derive(Clone, Default)]
+    struct FakeRunner {
+        ran: Rc<RefCell<Vec<(Gesture, String)>>>,
+        fail: Rc<Cell<bool>>,
+    }
+
+    impl ActionRunner for FakeRunner {
+        fn run(&mut self, gesture: Gesture, command: &str) -> Result<()> {
+            if self.fail.get() {
+                anyhow::bail!("no such shell");
+            }
+            self.ran.borrow_mut().push((gesture, command.to_string()));
+            Ok(())
         }
     }
 
@@ -815,6 +999,7 @@ mod tests {
         script: Rc<RefCell<Script>>,
         clock: Rc<Cell<Instant>>,
         events: std::sync::mpsc::Receiver<Event>,
+        runner: FakeRunner,
     }
 
     impl Rig {
@@ -823,17 +1008,30 @@ mod tests {
         }
 
         fn with(poses: Vec<Option<(f32, f32)>>, cal: Calibration, settings: Settings) -> Self {
+            Self::build(poses, cal, settings, None)
+        }
+
+        fn build(
+            poses: Vec<Option<(f32, f32)>>,
+            cal: Calibration,
+            settings: Settings,
+            state_path: Option<PathBuf>,
+        ) -> Self {
             let clock = Rc::new(Cell::new(Instant::now()));
             let hypr = Rc::new(FakeHypr::default());
             *hypr.monitors.borrow_mut() = monitors();
             hypr.cursor.set((1500, 500)); // on DP-2
             let script = Rc::new(RefCell::new(Script {
                 poses,
+                hands: Vec::new(),
                 i: 0,
                 clock: clock.clone(),
                 opens: 0,
                 fail_open: false,
                 fps: Vec::new(),
+                hands_on: false,
+                hands_calls: Vec::new(),
+                hand_samples: 0,
             }));
             let s2 = script.clone();
             let opener: Opener<Source> = Box::new(move || {
@@ -846,11 +1044,48 @@ mod tests {
                 Ok(Source(s2.clone()))
             });
             let c2 = clock.clone();
-            let mut d = Daemon::new(opener, hypr.clone(), cal, &settings, None, Box::new(move || c2.get())).unwrap();
+            let mut d =
+                Daemon::new(opener, hypr.clone(), cal, &settings, state_path, Box::new(move || c2.get())).unwrap();
             d.timing.warmup = Duration::ZERO;
+            let runner = FakeRunner::default();
+            d.set_runner(Box::new(runner.clone()));
             let events = d.events.subscribe();
             d.start();
-            Rig { d, hypr, script, clock, events }
+            Rig { d, hypr, script, clock, events, runner }
+        }
+
+        /// Gestures on from the start, with a face at DP-2 (where focus already
+        /// is, so nothing switches) and the given hand script. The poses can be
+        /// swapped by building a rig by hand.
+        fn gestures(hands: Vec<Option<Option<Gesture>>>) -> Self {
+            Self::gestures_with(hold(31.0, 2.0, hands.len()), hands, Settings::default())
+        }
+
+        fn gestures_with(
+            poses: Vec<Option<(f32, f32)>>,
+            hands: Vec<Option<Option<Gesture>>>,
+            mut settings: Settings,
+        ) -> Self {
+            settings.gestures.enabled = true;
+            let r = Self::with(poses, calibration(), settings);
+            r.script.borrow_mut().hands = hands;
+            r
+        }
+
+        fn ticks(&mut self, n: usize) {
+            for _ in 0..n {
+                if self.d.tick().unwrap() == Tick::Idle {
+                    self.clock.set(self.clock.get() + Duration::from_millis(200));
+                }
+            }
+        }
+
+        fn ran(&self) -> Vec<(Gesture, String)> {
+            self.runner.ran.borrow().clone()
+        }
+
+        fn gesture_events(&self) -> Vec<Event> {
+            self.events().into_iter().filter(|e| matches!(e, Event::Gesture { .. })).collect()
         }
 
         fn done(&self) -> bool {
@@ -878,6 +1113,28 @@ mod tests {
     fn hold(yaw: f32, pitch: f32, frames: usize) -> Vec<Option<(f32, f32)>> {
         vec![Some((yaw, pitch)); frames]
     }
+
+    type Hands = Vec<Option<Option<Gesture>>>;
+
+    /// An open palm for `frames` samples.
+    fn palm(frames: usize) -> Hands {
+        vec![Some(Some(Gesture::OpenPalm)); frames]
+    }
+
+    /// A hand that shows no gesture we know.
+    fn fist(frames: usize) -> Hands {
+        vec![Some(None); frames]
+    }
+
+    fn no_hand(frames: usize) -> Hands {
+        vec![None; frames]
+    }
+
+    fn cat(parts: &[Hands]) -> Hands {
+        parts.concat()
+    }
+
+    const PALM_COMMAND: &str = "voxtype record toggle";
 
     #[test]
     fn looking_at_a_monitor_focuses_it_and_restores_the_cursor() {
@@ -1139,5 +1396,361 @@ mod tests {
         assert!(s.face && s.camera && !s.adaptive);
         let json: serde_json::Value = serde_json::from_str(&r.d.handle_command(Command::Status)).unwrap();
         assert_eq!(json["state"], "tracking");
+    }
+
+    // ------------------------------------------------------------ gestures
+
+    #[test]
+    fn a_held_palm_fires_once() {
+        let mut r = Rig::gestures(cat(&[no_hand(5), palm(40), no_hand(5)]));
+        r.run_all();
+        assert_eq!(r.ran(), vec![(Gesture::OpenPalm, PALM_COMMAND.to_string())]);
+        assert_eq!(
+            r.gesture_events(),
+            vec![Event::Gesture { gesture: Gesture::OpenPalm, command: Some(PALM_COMMAND.into()) }]
+        );
+        assert!(r.focus_calls().is_empty());
+    }
+
+    #[test]
+    fn a_short_palm_does_not_fire() {
+        let mut r = Rig::gestures(cat(&[no_hand(5), palm(4), no_hand(20)]));
+        r.run_all();
+        assert!(r.ran().is_empty());
+        assert!(r.gesture_events().is_empty());
+    }
+
+    #[test]
+    fn a_gesture_re_arms_after_it_has_been_gone() {
+        // Gone for 800 ms in between: armed again, and the 1.5 s cooldown is over
+        // by the time the second palm has been held.
+        let mut r = Rig::gestures(cat(&[palm(15), no_hand(12), palm(15)]));
+        r.run_all();
+        assert_eq!(r.ran().len(), 2);
+
+        // Gone for only 260 ms: still the same raised hand as far as it knows.
+        let mut r = Rig::gestures(cat(&[palm(15), no_hand(4), palm(40)]));
+        r.run_all();
+        assert_eq!(r.ran().len(), 1);
+
+        // A hand showing something else counts as the palm being gone.
+        let mut r = Rig::gestures(cat(&[palm(15), fist(12), palm(15)]));
+        r.run_all();
+        assert_eq!(r.ran().len(), 2);
+    }
+
+    #[test]
+    fn the_cooldown_holds_back_the_next_firing() {
+        let mut settings = Settings::default();
+        settings.gestures.cooldown_ms = 4000;
+        let hands = cat(&[palm(15), no_hand(12), palm(20), palm(60)]);
+        let mut r = Rig::gestures_with(hold(31.0, 2.0, hands.len()), hands, settings);
+        // Up to the end of the second 20 frame palm it is about 2.6 s since the first.
+        r.ticks(15 + 12 + 20);
+        assert_eq!(r.ran().len(), 1);
+        // Still held when the cooldown ends, so it fires then.
+        r.run_all();
+        assert_eq!(r.ran().len(), 2);
+    }
+
+    #[test]
+    fn hold_time_comes_from_the_settings() {
+        let mut settings = Settings::default();
+        settings.gestures.hold_ms = 1000;
+        let hands = palm(30);
+        let mut r = Rig::gestures_with(hold(31.0, 2.0, 30), hands, settings);
+        r.ticks(14); // 13 frames after the first is 860 ms
+        assert!(r.ran().is_empty());
+        r.run_all();
+        assert_eq!(r.ran().len(), 1);
+    }
+
+    #[test]
+    fn gestures_work_while_tracking_is_paused() {
+        // The head points at eDP-2 the whole time, which would switch focus.
+        let hands = cat(&[palm(30), no_hand(80)]);
+        let mut r = Rig::gestures_with(hold(23.0, 2.0, 110), hands, Settings::default());
+        r.d.tick().unwrap(); // opens the camera
+        let reply = r.d.handle_command(Command::Pause);
+        assert!(reply.contains("\"state\":\"paused\""), "{reply}");
+        assert!(reply.contains("\"camera\":true"), "the camera stays open for gestures: {reply}");
+        r.ticks(29);
+        assert_eq!(r.ran().len(), 1);
+        assert!(r.d.status().camera && r.d.status().face);
+        assert_eq!(r.d.status().state, "paused");
+        assert!(r.focus_calls().is_empty(), "no focus switching while paused");
+        // Resuming switches as usual.
+        r.d.handle_command(Command::Resume);
+        r.run_all();
+        assert_eq!(r.focus_calls().len(), 1);
+        assert_eq!(r.script.borrow().opens, 1, "the camera was never closed");
+    }
+
+    #[test]
+    fn gestures_work_while_the_layout_has_changed() {
+        let mut r = Rig::gestures_with(hold(23.0, 2.0, 40), palm(40), Settings::default());
+        r.hypr.monitors.borrow_mut().remove(0);
+        r.d.handle_hypr_event(HyprEvent::MonitorRemoved("DP-1".into())).unwrap();
+        r.run_all();
+        assert_eq!(r.d.status().state, "layout_changed");
+        assert!(r.d.status().camera);
+        assert_eq!(r.ran().len(), 1);
+        assert!(r.focus_calls().is_empty());
+        assert!(r.events().iter().any(|e| matches!(e, Event::Paused { .. })));
+    }
+
+    #[test]
+    fn pausing_with_gestures_off_still_releases_the_camera() {
+        let mut r = Rig::new(hold(23.0, 2.0, 40));
+        r.d.tick().unwrap();
+        let reply = r.d.handle_command(Command::Pause);
+        assert!(reply.contains("\"camera\":false"), "{reply}");
+        assert_eq!(r.d.tick().unwrap(), Tick::Idle);
+    }
+
+    #[test]
+    fn turning_gestures_off_while_paused_releases_the_camera() {
+        let mut r = Rig::gestures(palm(60));
+        r.d.handle_command(Command::Pause);
+        r.ticks(3);
+        assert!(r.d.status().camera);
+        let reply = r.d.handle_command(Command::Gestures(GesturesCommand::Off));
+        assert!(reply.contains("\"camera\":false") && reply.contains("\"gestures\":false"), "{reply}");
+        assert_eq!(r.d.tick().unwrap(), Tick::Idle);
+        assert_eq!(r.script.borrow().hands_calls, vec![true, false]);
+    }
+
+    #[test]
+    fn turning_gestures_on_while_paused_opens_the_camera() {
+        let mut r = Rig::new(hold(31.0, 2.0, 60));
+        r.script.borrow_mut().hands = palm(60);
+        r.d.handle_command(Command::Pause);
+        assert_eq!(r.d.tick().unwrap(), Tick::Idle);
+        assert!(!r.d.status().camera);
+        r.d.handle_command(Command::Gestures(GesturesCommand::On));
+        r.run_all();
+        assert!(r.d.status().camera);
+        assert_eq!(r.ran().len(), 1);
+    }
+
+    #[test]
+    fn gestures_off_means_no_hand_processing() {
+        let mut r = Rig::with(hold(31.0, 2.0, 60), calibration(), Settings::default());
+        r.script.borrow_mut().hands = palm(60);
+        r.run_all();
+        assert!(r.ran().is_empty());
+        assert!(r.gesture_events().is_empty());
+        let s = r.script.borrow();
+        assert_eq!(s.hands_calls, vec![false]);
+        assert_eq!(s.hand_samples, 0, "no frame was read with hand tracking on");
+        drop(s);
+        assert!(!r.d.status().gestures && r.d.status().gesture.is_none());
+    }
+
+    #[test]
+    fn hands_follow_the_gestures_switch() {
+        let mut r = Rig::with(hold(31.0, 2.0, 120), calibration(), Settings::default());
+        r.script.borrow_mut().hands = palm(120);
+        r.ticks(10);
+        assert_eq!(r.script.borrow().hand_samples, 0);
+        let reply = r.d.handle_command(Command::Gestures(GesturesCommand::On));
+        assert!(reply.contains("\"gestures\":true"), "{reply}");
+        assert_eq!(r.script.borrow().hands_calls, vec![false, true]);
+        r.ticks(40);
+        assert_eq!(r.ran().len(), 1);
+        assert_eq!(r.d.status().gesture, Some(Gesture::OpenPalm));
+        // Off again: the hand is dropped from the status and nothing more fires.
+        r.d.handle_command(Command::Gestures(GesturesCommand::Toggle));
+        assert_eq!(r.d.status().gesture, None);
+        let seen = r.script.borrow().hand_samples;
+        r.run_all();
+        assert_eq!(r.script.borrow().hand_samples, seen);
+        assert_eq!(r.ran().len(), 1);
+        let events = r.events();
+        assert!(events.contains(&Event::GesturesChanged { enabled: true }));
+        assert!(events.contains(&Event::GesturesChanged { enabled: false }));
+    }
+
+    #[test]
+    fn setting_the_switch_to_what_it_already_is_does_nothing() {
+        let mut r = Rig::new(hold(31.0, 2.0, 5));
+        r.d.handle_command(Command::Gestures(GesturesCommand::Off));
+        assert!(!r.events().iter().any(|e| matches!(e, Event::GesturesChanged { .. })));
+    }
+
+    #[test]
+    fn a_hand_reopens_with_the_camera() {
+        // Pause with gestures off releases the camera. Gestures on and a resume
+        // reopens it with hand tracking on from the start.
+        let mut r = Rig::gestures(palm(80));
+        r.ticks(3);
+        r.d.handle_command(Command::Pause);
+        r.d.handle_command(Command::Gestures(GesturesCommand::Off));
+        assert!(!r.d.status().camera);
+        r.d.handle_command(Command::Gestures(GesturesCommand::On));
+        r.d.handle_command(Command::Resume);
+        r.run_all();
+        assert_eq!(r.script.borrow().opens, 2);
+        assert_eq!(r.script.borrow().hands_calls.last(), Some(&true));
+    }
+
+    #[test]
+    fn a_gesture_needs_a_face_when_asked_to() {
+        let mut r = Rig::gestures_with(vec![None; 40], palm(40), Settings::default());
+        r.run_all();
+        assert!(r.ran().is_empty());
+
+        let mut settings = Settings::default();
+        settings.gestures.require_face = false;
+        let mut r = Rig::gestures_with(vec![None; 40], palm(40), settings);
+        r.run_all();
+        assert_eq!(r.ran().len(), 1);
+    }
+
+    #[test]
+    fn a_gesture_without_a_command_only_sends_an_event() {
+        let mut settings = Settings::default();
+        settings.gestures.actions.clear();
+        let mut r = Rig::gestures_with(hold(31.0, 2.0, 30), palm(30), settings);
+        r.run_all();
+        assert!(r.ran().is_empty());
+        assert_eq!(r.gesture_events(), vec![Event::Gesture { gesture: Gesture::OpenPalm, command: None }]);
+
+        // An empty command is the same as none.
+        let mut settings = Settings::default();
+        settings.gestures.actions.insert(Gesture::OpenPalm, "  ".into());
+        let mut r = Rig::gestures_with(hold(31.0, 2.0, 30), palm(30), settings);
+        r.run_all();
+        assert!(r.ran().is_empty());
+        assert_eq!(r.gesture_events().len(), 1);
+    }
+
+    #[test]
+    fn a_command_that_cannot_start_does_not_stop_the_daemon() {
+        let mut r = Rig::gestures(cat(&[palm(20), no_hand(12), palm(20)]));
+        r.runner.fail.set(true);
+        r.run_all();
+        // Still reported, and the next gesture is still looked for.
+        assert_eq!(r.gesture_events().len(), 2);
+        assert_eq!(r.d.status().state, "tracking");
+    }
+
+    #[test]
+    fn the_configured_command_is_the_one_that_runs() {
+        let mut settings = Settings::default();
+        settings.gestures.actions.insert(Gesture::OpenPalm, "notify-send hi".into());
+        let mut r = Rig::gestures_with(hold(31.0, 2.0, 30), palm(30), settings);
+        r.run_all();
+        assert_eq!(r.ran(), vec![(Gesture::OpenPalm, "notify-send hi".to_string())]);
+    }
+
+    #[test]
+    fn away_releases_the_camera_for_gestures_too() {
+        let mut settings = Settings::default();
+        settings.power.away_after_s = 2;
+        settings.power.probe_every_s = 600;
+        let mut r = Rig::gestures_with(vec![None; 60], no_hand(60), settings);
+        r.d.tick().unwrap(); // opens the camera
+        r.d.handle_command(Command::Pause);
+        assert!(r.d.status().camera, "open for gestures");
+        // 2 s without a face is about 31 frames.
+        for _ in 0..40 {
+            r.d.tick().unwrap();
+            if !r.d.status().camera {
+                break;
+            }
+        }
+        assert!(!r.d.status().camera);
+        assert!(r.events().contains(&Event::Away));
+        // Moving the mouse brings the camera back, even while paused.
+        r.hypr.cursor.set((1600, 520));
+        r.script.borrow_mut().i = 0;
+        r.d.tick().unwrap();
+        assert!(r.d.status().camera);
+    }
+
+    #[test]
+    fn a_hand_in_view_keeps_the_full_frame_rate() {
+        let idle = |hands: Hands| {
+            let frames = hands.len();
+            let mut r = Rig::gestures_with(hold(31.0, 2.0, frames), hands, Settings::default());
+            r.run_all();
+            r.script.borrow().fps.clone()
+        };
+        // No hand and a still head: drops to the idle rate.
+        assert!(idle(no_hand(60)).contains(&6.0));
+        // A hand in view, even one showing nothing we know: stays at full rate.
+        assert_eq!(idle(fist(60)), vec![15.0]);
+        assert_eq!(idle(palm(60)), vec![15.0]);
+        // The hand leaves: the idle rate comes back after the head has been still.
+        let fps = idle(cat(&[palm(20), no_hand(60)]));
+        assert_eq!(fps.first(), Some(&15.0));
+        assert!(fps.contains(&6.0), "{fps:?}");
+    }
+
+    #[test]
+    fn a_hand_in_view_keeps_the_full_frame_rate_while_paused_too() {
+        let mut r = Rig::gestures_with(hold(31.0, 2.0, 80), fist(80), Settings::default());
+        r.d.handle_command(Command::Pause);
+        r.run_all();
+        assert_eq!(r.script.borrow().fps, vec![15.0]);
+        let mut r = Rig::gestures_with(hold(31.0, 2.0, 80), no_hand(80), Settings::default());
+        r.d.handle_command(Command::Pause);
+        r.run_all();
+        assert!(r.script.borrow().fps.contains(&6.0));
+    }
+
+    #[test]
+    fn status_shows_gestures_and_the_current_hand() {
+        let mut r = Rig::gestures(cat(&[no_hand(3), fist(3), palm(3)]));
+        r.ticks(2);
+        let s = r.d.status();
+        assert!(s.gestures && s.gesture.is_none());
+        r.ticks(2); // a hand with no known gesture
+        assert_eq!(r.d.status().gesture, None);
+        r.ticks(3);
+        assert_eq!(r.d.status().gesture, Some(Gesture::OpenPalm));
+        let json: serde_json::Value = serde_json::from_str(&r.d.handle_command(Command::Status)).unwrap();
+        assert_eq!(json["gestures"], true);
+        assert_eq!(json["gesture"], "open_palm");
+        // Releasing the camera clears it.
+        r.d.handle_command(Command::Gestures(GesturesCommand::Off));
+        r.d.handle_command(Command::Pause);
+        let json: serde_json::Value = serde_json::from_str(&r.d.handle_command(Command::Status)).unwrap();
+        assert_eq!(json["gesture"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn the_gestures_switch_is_remembered_between_runs() {
+        let dir = std::env::temp_dir().join(format!("lookfocus-gestures-state-{}", std::process::id()));
+        let path = dir.join("state.json");
+        let mut r = Rig::build(hold(31.0, 2.0, 5), calibration(), Settings::default(), Some(path.clone()));
+        assert!(!r.d.status().gestures);
+        r.d.handle_command(Command::Gestures(GesturesCommand::On));
+        assert_eq!(State::load(&path).gestures, Some(true));
+
+        // A new run starts with it on, whatever the settings say.
+        let r2 = Rig::build(hold(31.0, 2.0, 5), calibration(), Settings::default(), Some(path.clone()));
+        assert!(r2.d.status().gestures);
+
+        // The saved choice wins over the settings in both directions.
+        let mut on = Settings::default();
+        on.gestures.enabled = true;
+        r.d.handle_command(Command::Gestures(GesturesCommand::Off));
+        let r3 = Rig::build(hold(31.0, 2.0, 5), calibration(), on, Some(path.clone()));
+        assert!(!r3.d.status().gestures);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn other_state_changes_do_not_pin_the_gestures_setting() {
+        // Only an explicit choice is saved, so editing config.toml still works
+        // for someone who never touched the switch.
+        let dir = std::env::temp_dir().join(format!("lookfocus-gestures-pin-{}", std::process::id()));
+        let path = dir.join("state.json");
+        let mut r = Rig::build(hold(31.0, 2.0, 5), calibration(), Settings::default(), Some(path.clone()));
+        r.d.handle_command(Command::Adaptive(AdaptiveCommand::On));
+        assert_eq!(State::load(&path).gestures, None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
