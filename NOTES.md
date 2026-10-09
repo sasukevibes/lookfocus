@@ -3,6 +3,32 @@
 A running log of decisions, verified facts, and open questions. Newest phase at
 the top of each section. The project brief is in `docs/SPEC.md`.
 
+## Gesture actions (2026-10-09, not yet run on a camera)
+
+Tested with scripted samples, a fake command runner and fake time only. The
+hand models themselves are still unchecked (see the next section), so none of
+this has been seen working end to end.
+
+To check on the first real run:
+
+- `lookfocus gestures on`, raise an open palm facing the camera, and see
+  `voxtype record toggle` run once after about 0.4 s. `lookfocus debug` shows
+  `hand open_palm` while it is up.
+- Whether the palm covers enough of the face to lose it. `require_face`
+  restarts the hold whenever the face drops out, so a palm held right in front
+  of the face may never fire. If so, `require_face = false` is the escape, or
+  the rule needs a short grace period for dropped faces.
+- Whether the classifier flickers. A single frame without the gesture restarts
+  the hold, and nothing smooths it yet. If it flickers, give `Trigger` a short
+  dropout tolerance.
+- Latency from raising the hand. With the head still the daemon samples at
+  `idle_fps` (6) and the palm detector runs on one frame in four while no hand
+  is tracked, so a hand can take up to about 0.7 s to be noticed, plus the
+  hold. The rate goes to full only once a hand is seen.
+- CPU with gestures on. The hand models run on every frame while the camera is
+  open, including while tracking is paused.
+- That `voxtype` is on the service's PATH. The unit sets no PATH of its own.
+
 ## Hand tracking (2026-10-09, not yet run on real models)
 
 Written and tested with fakes only, without network access, so nothing in
@@ -333,6 +359,57 @@ The camera is the laptop's integrated UVC camera (`uvcvideo`,
 
 ## Decisions
 
+### Gesture actions (2026-10-09)
+
+- Gestures and focus tracking are two independent switches. The camera is
+  wanted when focus tracking is active (not paused, layout matches) or
+  gestures are on, and away applies to both. While tracking is paused or the
+  layout changed with gestures on, the camera stays open and the tick skips
+  pose filtering, zones and switching but still reports faces and handles
+  hands. `lookfocus pause` with gestures on therefore does not release the
+  camera.
+- Because of that, `calibrate` and `debug` can no longer borrow the camera by
+  pausing alone. `borrow_camera_from_daemon` now also sends `gestures off` and
+  gives gestures back afterwards, which writes the switch to `state.json` twice
+  but leaves it as it was.
+- The switch lives in `state.json` as `gestures: Option<bool>`, like
+  `adaptive`, with `[gestures] enabled` as the default. Unlike `adaptive`, the
+  daemon writes back only an explicit choice, not the effective value, so an
+  unrelated state save (adaptive learning) does not pin the config value.
+- `PoseSource::set_hands(bool)` turns hand tracking on or off. `Sampler` takes
+  a loader closure (`with_hand_loader`), loads the hand models on
+  `set_hands(true)` and drops them on `set_hands(false)`. The daemon calls it
+  right after each camera open, since a reopened camera is a new sampler. A
+  load failure or a hand model error leaves hands off without loading again.
+  `calibrate` no longer runs the hand models at all, and `debug` turns them on
+  always so the hand can be checked.
+- The trigger (`src/trigger.rs`) is a plain state machine fed `(time, gesture,
+  face)` per sample, with times from the frame, so it is tested with made-up
+  times. A gesture fires once held for `hold_ms` with a face (when
+  `require_face`). After it fires it is spent until it has been absent from the
+  samples for 500 ms (fixed, not configurable).
+  Re-arming looks at the raw gesture, not at the face, so a palm held through a
+  lost face does not fire twice. `cooldown_ms` is the least time between two
+  firings of any gesture, and a gesture held through it fires when it ends
+  (the cooldown delays a firing and does not discard it). Releasing the camera
+  forgets the hold and the spent state but keeps the cooldown.
+- A hand in view (any hand, even with no known gesture) keeps the full frame
+  rate, so the idle drop to `idle_fps` waits until the hand has gone and the
+  head has been still for a second.
+- Commands run through `sh -c` behind the `ActionRunner` trait
+  (`src/actions.rs`), started detached in their own process group with no
+  stdin or stdout (stderr stays connected to the journal). A thread per command
+  waits for it, which reaps it, and logs a nonzero exit or a signal. The daemon
+  never waits. An empty command means no action.
+- `Event::Gesture { gesture, command }` goes out whenever a gesture fires, with
+  `command` None when nothing is set, so tools can use gestures through
+  `lookfocus watch` without lookfocus running anything. `Status` gained
+  `gestures` and `gesture` (the hand's current gesture), both
+  `#[serde(default)]` so a newer CLI can read an older daemon's reply.
+- Not done: gesture-specific config for hold time, any gesture besides the open
+  palm, and re-reading `[gestures]` without a restart (`reload` still only reads
+  the calibration).
+
 ### Hand tracking (2026-10-09)
 
 - The SSD anchor, decode and weighted NMS code is shared by faces and palms,
@@ -355,17 +432,19 @@ The camera is the laptop's integrated UVC camera (`uvcvideo`,
 - The hand models are optional: `find_model_dir` still needs only the face
   models. `models::load_hand_tracker` returns None without them and logs one
   warning per process (the daemon reopens the camera after every pause).
-- Wiring: `Sampler` holds an optional hand tracker (`with_hands`), and each
-  `Sample` has `hand: Option<HandSample>` with the gesture, the hand
-  confidence and the handedness score. It is always None without the hand
-  models. Every live sampler (`run`, `calibrate`, `debug`, the record
-  example) gets hands when the models are there.
+- Wiring: `Sampler` holds an optional hand tracker, and each `Sample` has
+  `hand: Option<HandSample>` with the gesture, the hand confidence and the
+  handedness score. It is None without the hand models, and while hand
+  tracking is off. This was first wired on for every live sampler. The gesture
+  actions branch changed it: hand tracking is off until
+  `PoseSource::set_hands(true)`, and the hand models load only then (see
+  Gesture actions in Decisions). The record example still builds its sampler
+  with hands always on.
 - A hand model error at run time logs a warning and turns hand tracking off
   for that sampler instead of failing the sample. The hand output layout is
   still unverified, and a wrong guess must not stop focus switching.
-- Nothing acts on gestures yet, and daemon behavior is unchanged. A later
-  branch connects gestures to actions. `Gesture` serializes in snake_case
-  (`open_palm`) so config can name it.
+- `Gesture` serializes in snake_case (`open_palm`) so config can name it.
+  Acting on gestures is described under Gesture actions in Decisions.
 - Cost to check on the first real run: with no hand in view, the palm
   detector runs on one frame in four in every live sampler, including the
   daemon's.

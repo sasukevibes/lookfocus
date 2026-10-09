@@ -4,7 +4,7 @@
   "name": "lookfocus",
   "version": "0.1.0",
   "author": "sasukevibes",
-  "description": "Bar button for lookfocus, which focuses the monitor you are facing. Click to pause or resume, right-click for adaptive centroids, recalibration and the service.",
+  "description": "Bar button for lookfocus, which focuses the monitor you are facing. Click to pause or resume, right-click for adaptive centroids, hand gestures, recalibration and the service.",
   "kinds": ["bar-widget"],
   "activation": "on-demand",
   "entryPoints": { "barWidget": "BarWidget.qml" },

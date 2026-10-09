@@ -12,7 +12,7 @@ Two other files are written by lookfocus itself. Do not edit them by hand:
 | File | Written by | Contents |
 |---|---|---|
 | `~/.config/lookfocus/calibration.toml` | `lookfocus calibrate` | Head pose per monitor, the monitor layout, look-down threshold |
-| `~/.local/state/lookfocus/state.json` | the daemon | The adaptive centroids switch and what it learned |
+| `~/.local/state/lookfocus/state.json` | the daemon | The adaptive centroids and gestures switches, and what adaptive learning learned |
 
 ## Full example with defaults
 
@@ -51,11 +51,44 @@ idle_fps = 6.0           # samples per second while the head is still
 away_after_s = 30        # release the camera after this long without a face
 probe_every_s = 20       # while away, look for a face this often
 
+[gestures]
+enabled = false          # the bar menu and `lookfocus gestures` override this
+hold_ms = 400            # how long a gesture must be held before it counts
+cooldown_ms = 1500       # the least time between two firings
+require_face = true      # count a gesture only while your face is in view
+
+[gestures.actions]       # gesture name = shell command, run with sh -c
+open_palm = "voxtype record toggle"
+
 [filter]                 # One Euro filter on yaw and pitch
 min_cutoff = 1.0         # Hz. Lower is smoother when still, but laggier
 beta = 0.05              # higher follows fast moves more closely
 d_cutoff = 1.0           # Hz, for the speed estimate
 ```
+
+## Gestures
+
+`[gestures]` is described in the README. The details that matter for tuning:
+
+- `enabled` is only the starting value. Once you use the bar menu or
+  `lookfocus gestures on|off|toggle`, the choice is kept in `state.json` and
+  wins over `enabled`. Remove the `gestures` entry from `state.json` to go back to
+  the config value.
+- A gesture fires after `hold_ms` of being held without a break. Once it has
+  fired it can fire again only after it has been out of the picture for 500 ms
+  (this is fixed), and at least `cooldown_ms` after the last firing. A gesture
+  still held when the cooldown ends fires then.
+- With `require_face = true`, the hold only counts while a face is in view. If
+  your hand covers your face, the hold restarts. Set it to `false` to let
+  gestures work with no face, for example when you sit back from the camera.
+- `[gestures.actions]` maps a gesture name to a command. The only gesture name
+  so far is `open_palm`. A name that does not exist is an error. Setting a
+  command to an empty string turns the action off for that gesture. If you
+  write the table, it replaces the default, so list every action you want.
+- Commands run with `sh -c` as you, from the daemon's environment. They are not
+  waited for. One that cannot start, or exits with a nonzero status, is logged.
+- The camera stays open while gestures are on, including while focus tracking
+  is paused. Only `away_after_s` releases it.
 
 ## Tuning tips
 
@@ -68,6 +101,11 @@ d_cutoff = 1.0           # Hz, for the speed estimate
   `power.idle_fps` to 4. A turn is then noticed up to a quarter of a second
   later.
 - **The cursor should stay where Hyprland puts it**: set `cursor = "hyprland"`.
+- **A gesture fires by accident**: raise `hold_ms` (600 is still quick) or
+  `cooldown_ms`.
+- **A gesture is slow to fire**: lower `hold_ms`, and check that `fps` is not
+  very low, since the hand is found on one frame in four while no hand is in
+  view.
 
 ## Environment variables
 

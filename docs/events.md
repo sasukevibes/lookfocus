@@ -55,6 +55,8 @@ Each line is one JSON object with an `event` field.
 | `resumed` | | Switching started again |
 | `camera_unavailable` | `reason` | The camera could not be opened |
 | `adaptive_changed` | `enabled` | Adaptive centroids were switched on or off |
+| `gestures_changed` | `enabled` | Hand gestures were switched on or off |
+| `gesture` | `gesture`, `command` | A hand gesture was held long enough to count. `gesture` is its name (`open_palm`). `command` is the shell command lookfocus ran for it, or `null` if none is set |
 
 Example:
 
@@ -62,6 +64,14 @@ Example:
 {"event":"zone","monitor":"eDP-2"}
 {"event":"switched","from":"DP-2","to":"eDP-2"}
 {"event":"paused","reason":"paused"}
+{"event":"gesture","gesture":"open_palm","command":"voxtype record toggle"}
+```
+
+The `gesture` event is sent when the gesture fires, so a tool that only wants to
+react to gestures can use it and leave `command` empty in `config.toml`:
+
+```sh
+lookfocus watch | jq -c 'select(.event == "gesture")'
 ```
 
 ## Other control commands
@@ -74,6 +84,7 @@ line. The CLI uses these:
 | `status` | Current status (see `lookfocus status --json`) |
 | `pause`, `resume`, `toggle` | Status after the change |
 | `adaptive on`, `adaptive off`, `adaptive toggle`, `adaptive reset` | Status after the change |
+| `gestures on`, `gestures off`, `gestures toggle` | Status after the change |
 | `reload` | Status after reading `calibration.toml` again |
 
 ## Design notes
