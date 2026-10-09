@@ -12,6 +12,8 @@ on any Hyprland setup.
 - Any camera position. The camera does not need to be in the middle.
 - Mouse movement always wins, and a keybind or bar button pauses it.
 - Runs on the CPU, with no GPU needed. Frames never leave memory.
+- Optional hand gestures: hold up an open palm to run a command, such as
+  toggling dictation.
 
 ## Privacy
 
@@ -19,8 +21,10 @@ lookfocus processes camera frames in memory only. It never stores a frame,
 never sends anything over the network, and never reads your keyboard. The only
 things it writes to disk are head angles: your calibration
 (`~/.config/lookfocus/calibration.toml`) and, if you turn on adaptive
-centroids, what it learned (`~/.local/state/lookfocus/state.json`). The camera
-is released whenever lookfocus is paused or nobody is in front of it.
+centroids, what it learned (`~/.local/state/lookfocus/state.json`), and the
+adaptive and gestures switches. The camera is released whenever lookfocus is
+paused or nobody is in front of it, except that it stays open while hand
+gestures are on, since they need it.
 
 ## Demo
 
@@ -131,8 +135,8 @@ there). Then add `"sasukevibes.lookfocus"` to a bar section in
 
 - Left click pauses or resumes. The icon shows the state, and the name of the
   focused monitor while tracking.
-- Right click opens a menu with tracking, adaptive centroids, recalibrate and
-  start/stop service.
+- Right click opens a menu with tracking, adaptive centroids, gestures,
+  recalibrate and start/stop service.
 
 ### 4. Add a keybind
 
@@ -162,8 +166,8 @@ lists what is taken.
 | Situation | What lookfocus does |
 |---|---|
 | You move the mouse | Holds switching for 2 seconds after the last movement |
-| You press the keybind or click the bar button | Pauses and releases the camera, or resumes |
-| No face in view | Holds the current monitor. After 30 seconds it releases the camera, and comes back when you move the mouse |
+| You press the keybind or click the bar button | Pauses and releases the camera, or resumes. With gestures on, the camera stays open for them and only focus switching stops |
+| No face in view | Holds the current monitor. After 30 seconds it releases the camera (gestures included), and comes back when you move the mouse |
 | You look down at the keyboard or a phone | Holds the current monitor, if calibration could tell looking down apart from your screens |
 | The monitor layout changes | Pauses with a notification asking you to recalibrate, and resumes on its own if the layout comes back |
 | Another app needs the camera | Pause lookfocus first (for a video call, say). If the camera is busy when lookfocus starts, it retries every 5 seconds |
@@ -191,6 +195,64 @@ lookfocus adaptive reset   # forget what was learned
 It is off by default. The bar menu has a switch for it, which also shows how
 far each screen has moved.
 
+## Hand gestures
+
+lookfocus can run a command when you hold up a hand. The only gesture so far
+is the open palm (all five fingers spread, facing the camera), and by default
+it runs `voxtype record toggle`, so one palm starts voxtype dictation and the
+next one stops it.
+
+Gestures are off by default. Switch them on with the bar menu, or:
+
+```sh
+lookfocus gestures on      # or off, toggle
+```
+
+The switch is kept between runs. To have them on from the start for good, set
+`enabled = true` under `[gestures]` in `config.toml`. Gestures need the hand
+models (`hand_detector.onnx` and `hand_landmarks.onnx`), which
+`scripts/fetch-models.sh` downloads next to the face models. Without them
+lookfocus logs "hand tracking is off" and focus tracking carries on as usual.
+
+How it works:
+
+- Gestures and focus tracking are separate switches. The camera is open when
+  either one wants it. Pausing focus tracking, or a monitor layout change,
+  stops focus switching but not gestures. Only turning both off releases the
+  camera.
+- A gesture counts after you hold it for 400 ms with your face in view. A hand
+  waved across the picture, or raised while you are not there, does nothing.
+- It fires once. To fire it again, lower your hand for half a second, then
+  raise it. Two firings are at least 1.5 seconds apart.
+- The hand models run only while gestures are on. While a hand is in view,
+  lookfocus samples at the full rate so it does not miss the gesture.
+- If nobody is in front of the camera for 30 seconds, the camera is released
+  for gestures too, and comes back when you move the mouse.
+
+Change the timing, or the command for a gesture, in `config.toml`:
+
+```toml
+[gestures]
+enabled = true
+hold_ms = 400
+cooldown_ms = 1500
+require_face = true
+
+[gestures.actions]
+open_palm = "voxtype record toggle"
+```
+
+Commands run through `sh -c`, so pipes and arguments work. lookfocus does not
+wait for them, and logs one that cannot start or exits with an error (see
+`journalctl --user -u lookfocus`). The service's PATH can be shorter than your
+terminal's (it may lack `~/.local/bin`, for one), so give the full path to a
+command that lives somewhere unusual.
+Setting a gesture's command to `""` turns its action off. The `gesture` event
+still goes out for other tools (see [docs/events.md](docs/events.md)).
+
+`lookfocus debug` shows the hand and the gesture it sees, whatever the gestures
+setting is, so you can check that the models work.
+
 ## Commands
 
 | Command | What it does |
@@ -202,7 +264,8 @@ far each screen has moved.
 | `lookfocus pause`, `lookfocus resume` | Explicit versions of toggle |
 | `lookfocus status [--json]` | Show the state, focused monitor and camera |
 | `lookfocus adaptive on\|off\|toggle\|reset` | Control adaptive centroids |
-| `lookfocus debug [--json]` | Live pose, zone and what the daemon would do |
+| `lookfocus gestures on\|off\|toggle` | Switch hand gestures |
+| `lookfocus debug [--json]` | Live pose, hand, zone and what the daemon would do |
 | `lookfocus watch` | Stream events as JSON lines (experimental, see below) |
 
 ## Configuration
@@ -223,6 +286,13 @@ mouse_hold_ms = 2000
 
 [adaptive]
 enabled = false
+
+[gestures]
+enabled = false         # or switch at run time: lookfocus gestures on
+hold_ms = 400
+
+[gestures.actions]
+open_palm = "voxtype record toggle"
 ```
 
 ## Event stream (experimental)
@@ -237,6 +307,14 @@ change before 1.0.
 **"model files not found"**: run `scripts/fetch-models.sh`, or point
 `models_dir` in config.toml at a folder with `face_detector.onnx` and
 `face_landmarks.onnx`.
+
+**"hand tracking is off"**: gestures are on but the hand models are missing.
+Run `scripts/fetch-models.sh`, or put `hand_detector.onnx` and
+`hand_landmarks.onnx` next to the face models.
+
+**A gesture does nothing**: run `lookfocus debug` and raise your hand. It
+should show `hand open_palm`. If it does, check the log for the command's own
+error, and that your face is in view (`require_face`).
 
 **"could not load ONNX Runtime"**: `sudo pacman -S onnxruntime-cpu`, or set
 `ORT_DYLIB_PATH` to your `libonnxruntime.so`.

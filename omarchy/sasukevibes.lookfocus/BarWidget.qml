@@ -10,9 +10,9 @@ import qs.Ui
 //
 // Left click pauses or resumes tracking (starting the service if it is not
 // running). Right click opens a dropdown with tracking, adaptive centroids,
-// recalibration and the service. Everything goes through the `lookfocus`
-// CLI, the same one the keybind uses, so the bar never talks to the daemon
-// directly.
+// hand gestures, recalibration and the service. Everything goes through the
+// `lookfocus` CLI, the same one the keybind uses, so the bar never talks to
+// the daemon directly.
 Panel {
   id: root
   moduleName: "sasukevibes.lookfocus"
@@ -21,7 +21,7 @@ Panel {
   implicitHeight: Style.bar.sizeHorizontal
 
   // `lookfocus status --json`, or a placeholder until the first answer.
-  property var status: ({ running: false, state: "unknown", adaptive: false, drift: [] })
+  property var status: ({ running: false, state: "unknown", adaptive: false, gestures: false, gesture: null, drift: [] })
   property bool cliMissing: false
 
   readonly property string stateName: String(status.state || "unknown")
@@ -61,7 +61,7 @@ Panel {
     case "tracking": return "Tracking · focused on " + (status.monitor || "?")
       + (status.zone ? " · facing " + status.zone : "")
     case "away": return "Away · camera released until you are back"
-    case "paused": return "Paused · camera released"
+    case "paused": return "Paused · " + (status.gestures ? "camera open for gestures" : "camera released")
     case "stopped": return "Not running"
     case "not_calibrated": return "Not calibrated yet"
     case "layout_changed": return "Monitor layout changed · recalibrate"
@@ -77,6 +77,12 @@ Panel {
       if (d[i][1] > 0.05) parts.push(d[i][0] + " " + Number(d[i][1]).toFixed(1) + "°")
     }
     return parts.length ? "Learned: " + parts.join(", ") : "Learns where you look from mouse use"
+  }
+
+  function gesturesText() {
+    if (!status.gestures) return "Hold up a hand to run a command"
+    var seeing = status.gesture ? " · seeing " + String(status.gesture).replace(/_/g, " ") : ""
+    return "Camera stays open, even while paused" + seeing
   }
 
   function tip() {
@@ -164,7 +170,8 @@ Panel {
       Toggle {
         width: parent.width
         label: "Tracking"
-        description: root.tracking ? "Focus follows your head · SUPER+ALT+E" : "Off · camera released"
+        description: root.tracking ? "Focus follows your head · SUPER+ALT+E"
+          : (root.status.gestures ? "Off · camera open for gestures" : "Off · camera released")
         checked: root.tracking
         onClicked: root.run([root.tracking ? "pause" : "resume"])
       }
@@ -175,6 +182,14 @@ Panel {
         description: root.learnedText()
         checked: !!root.status.adaptive
         onClicked: root.run(["adaptive", "toggle"])
+      }
+
+      Toggle {
+        width: parent.width
+        label: "Gestures"
+        description: root.gesturesText()
+        checked: !!root.status.gestures
+        onClicked: root.run(["gestures", "toggle"])
       }
 
       PanelSeparator {}

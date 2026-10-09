@@ -7,6 +7,7 @@
 //! - `calibration.toml` is written by `lookfocus calibrate`. Keeping it
 //!   separate means recalibrating never rewrites your settings or comments.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::classify::Centroid;
 use crate::filter::OneEuroParams;
+use crate::gesture::Gesture;
 use crate::hypr::Monitor;
 
 pub const SETTINGS_FILE: &str = "config.toml";
@@ -37,6 +39,7 @@ pub struct Settings {
     pub overrides: OverrideSettings,
     pub adaptive: AdaptiveSettings,
     pub power: PowerSettings,
+    pub gestures: GestureSettings,
     /// Directory with the ONNX models. Unset means the usual search path.
     pub models_dir: Option<PathBuf>,
 }
@@ -90,6 +93,36 @@ pub struct PowerSettings {
 impl Default for PowerSettings {
     fn default() -> Self {
         Self { idle_fps: 6.0, away_after_s: 30, probe_every_s: 20 }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GestureSettings {
+    /// Watch for hand gestures. The bar menu and `lookfocus gestures` can
+    /// switch this at run time, which overrides this value.
+    pub enabled: bool,
+    /// How long a gesture must be held before it counts.
+    pub hold_ms: u64,
+    /// The least time between two gestures firing.
+    pub cooldown_ms: u64,
+    /// Count a gesture only while your face is in view, so a hand waved at the
+    /// camera from across the room does nothing.
+    pub require_face: bool,
+    /// The shell command to run for each gesture, by gesture name. A gesture
+    /// with no entry, or an empty one, does nothing but send an event.
+    pub actions: BTreeMap<Gesture, String>,
+}
+
+impl Default for GestureSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hold_ms: 400,
+            cooldown_ms: 1500,
+            require_face: true,
+            actions: BTreeMap::from([(Gesture::OpenPalm, "voxtype record toggle".to_string())]),
+        }
     }
 }
 
@@ -340,6 +373,35 @@ mod tests {
         std::fs::write(&path, "[switching]\ndwel_ms = 450\n").unwrap();
         assert!(Settings::load(&path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gesture_settings_default_and_parse() {
+        let g = GestureSettings::default();
+        assert!(!g.enabled && g.require_face);
+        assert_eq!((g.hold_ms, g.cooldown_ms), (400, 1500));
+        assert_eq!(g.actions.get(&Gesture::OpenPalm).map(String::as_str), Some("voxtype record toggle"));
+
+        let s: Settings = toml::from_str(
+            "[gestures]\nenabled = true\nhold_ms = 600\nrequire_face = false\n\
+             [gestures.actions]\nopen_palm = \"notify-send 'hello there' | cat\"\n",
+        )
+        .unwrap();
+        assert!(s.gestures.enabled && !s.gestures.require_face);
+        assert_eq!((s.gestures.hold_ms, s.gestures.cooldown_ms), (600, 1500));
+        assert_eq!(s.gestures.actions[&Gesture::OpenPalm], "notify-send 'hello there' | cat");
+
+        // Leaving out the table keeps the default action.
+        let s: Settings = toml::from_str("[gestures]\nenabled = true\n").unwrap();
+        assert_eq!(s.gestures.actions, GestureSettings::default().actions);
+    }
+
+    #[test]
+    fn gesture_settings_reject_typos_and_unknown_gestures() {
+        assert!(toml::from_str::<Settings>("[gestures]\nhold = 600\n").is_err());
+        let err = toml::from_str::<Settings>("[gestures.actions]\nopen_palms = \"x\"\n").unwrap_err();
+        assert!(err.to_string().contains("open_palms"), "{err}");
+        assert!(toml::from_str::<Settings>("[gestures.actions]\nopen_palm = 3\n").is_err());
     }
 
     #[test]

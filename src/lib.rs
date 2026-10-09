@@ -4,6 +4,7 @@
 //! monitor classification. Each stage lives in its own module and has no
 //! knowledge of the stages around it, so each can be tested on its own.
 
+pub mod actions;
 pub mod adaptive;
 pub mod calibrate;
 pub mod camera;
@@ -22,4 +23,5 @@ pub mod pose;
 pub mod sampler;
 pub mod state;
 pub mod switcher;
+pub mod trigger;
 pub mod vision;

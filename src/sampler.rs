@@ -1,9 +1,11 @@
 //! Camera frame in, head pose sample out.
 //!
 //! This joins the camera, the face tracker and the pose fit into one step so
-//! the CLI commands and the daemon all read poses the same way. When the hand
-//! models are installed it also tracks a hand and names its gesture. Nothing
-//! acts on gestures yet.
+//! the CLI commands and the daemon all read poses the same way. When hand
+//! tracking is switched on and the hand models are installed, it also tracks a
+//! hand and names its gesture. Hand tracking is off until asked for, and the
+//! hand models are loaded only then, so they cost nothing for people who do
+//! not use gestures.
 
 use std::time::{Duration, Instant};
 
@@ -55,24 +57,47 @@ pub trait PoseSource {
 
     /// Changes the target sample rate, where the source supports it.
     fn set_fps(&mut self, _fps: f32) {}
+
+    /// Turns hand tracking on or off, where the source supports it. Samples
+    /// carry no hand while it is off.
+    fn set_hands(&mut self, _on: bool) {}
 }
+
+/// Loads the hand tracker when hand tracking is first switched on. Returns
+/// None if the hand models are missing or fail to load.
+type HandLoader = Box<dyn FnMut() -> Option<Box<dyn HandSource>>>;
 
 pub struct Sampler<C, D, M> {
     camera: C,
     tracker: FaceTracker<D, M>,
-    /// None when the hand models are missing, so samples carry no hand.
+    /// The loaded hand tracker. None when hand tracking is off, when the hand
+    /// models are missing, or after a hand model error.
     hands: Option<Box<dyn HandSource>>,
+    /// Whether hand tracking is switched on. Stays true after a hand model
+    /// error, so the tracker is not loaded again and again.
+    hands_on: bool,
+    /// Where `set_hands(true)` gets a tracker from. None for a sampler given
+    /// its tracker up front.
+    hand_loader: Option<HandLoader>,
 }
 
 impl<C: FrameSource, D: FaceDetector, M: FaceMesh> Sampler<C, D, M> {
     pub fn new(camera: C, tracker: FaceTracker<D, M>) -> Self {
-        Self { camera, tracker, hands: None }
+        Self { camera, tracker, hands: None, hands_on: false, hand_loader: None }
     }
 
-    /// Adds hand tracking. None leaves it off, which is what a missing set of
-    /// hand models gives.
+    /// Adds hand tracking that is on from the start. None leaves hand samples
+    /// empty, which is what a missing set of hand models gives.
     pub fn with_hands(mut self, hands: Option<impl HandSource + 'static>) -> Self {
         self.hands = hands.map(|h| Box::new(h) as Box<dyn HandSource>);
+        self.hands_on = true;
+        self
+    }
+
+    /// Adds hand tracking that starts off. `set_hands(true)` calls `load` to
+    /// get the tracker, and `set_hands(false)` drops it again.
+    pub fn with_hand_loader<H: HandSource + 'static>(mut self, mut load: impl FnMut() -> Option<H> + 'static) -> Self {
+        self.hand_loader = Some(Box::new(move || load().map(|h| Box::new(h) as Box<dyn HandSource>)));
         self
     }
 
@@ -88,6 +113,9 @@ impl<C: FrameSource, D: FaceDetector, M: FaceMesh> Sampler<C, D, M> {
     /// tracking off for this sampler instead of failing the sample, so face
     /// tracking keeps working whatever the hand models do.
     fn track_hand(&mut self, image: &RgbImage) -> Option<HandSample> {
+        if !self.hands_on {
+            return None;
+        }
         let hands = self.hands.as_mut()?;
         match hands.process(image) {
             Ok(hand) => hand.map(|h| HandSample {
@@ -107,6 +135,23 @@ impl<C: FrameSource, D: FaceDetector, M: FaceMesh> Sampler<C, D, M> {
 impl<C: FrameSource, D: FaceDetector, M: FaceMesh> PoseSource for Sampler<C, D, M> {
     fn set_fps(&mut self, fps: f32) {
         self.camera.set_fps(fps);
+    }
+
+    fn set_hands(&mut self, on: bool) {
+        if on == self.hands_on {
+            return;
+        }
+        self.hands_on = on;
+        if on {
+            if self.hands.is_none() {
+                self.hands = self.hand_loader.as_mut().and_then(|load| load());
+            }
+        } else if self.hand_loader.is_some() {
+            // Free the models. Switching back on loads them again.
+            self.hands = None;
+        } else if let Some(hands) = &mut self.hands {
+            hands.reset();
+        }
     }
 
     fn sample(&mut self) -> Result<Sample> {
@@ -133,6 +178,8 @@ mod tests {
     use crate::vision::hand::{NUM_HAND_LANDMARKS, WRIST};
     use crate::vision::{Hand, MeshOutput, Roi};
     use anyhow::bail;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     /// Face models that never find a face, since these tests are about hands.
     struct NoFace;
@@ -178,7 +225,7 @@ mod tests {
     }
 
     fn sampler() -> Sampler<MockCamera, NoFace, NoFace> {
-        let frames = vec![RgbImage::new(64, 48); 3];
+        let frames = vec![RgbImage::new(64, 48); 6];
         Sampler::new(MockCamera::new(frames, 15.0), FaceTracker::new(NoFace, NoFace))
     }
 
@@ -208,6 +255,58 @@ mod tests {
         assert!(s.sample().unwrap().hand.is_none());
         let mut s = sampler();
         assert!(s.sample().unwrap().hand.is_none());
+    }
+
+    #[test]
+    fn hands_load_only_when_switched_on_and_are_dropped_when_switched_off() {
+        let loads = Rc::new(Cell::new(0));
+        let counter = loads.clone();
+        let mut s = sampler().with_hand_loader(move || {
+            counter.set(counter.get() + 1);
+            Some(FakeHands { landmarks: Some(open_palm()) })
+        });
+        // Off until asked: nothing loaded, no hand in the sample.
+        assert!(s.sample().unwrap().hand.is_none());
+        assert_eq!(loads.get(), 0);
+        s.set_hands(true);
+        s.set_hands(true);
+        assert_eq!(loads.get(), 1);
+        assert_eq!(s.sample().unwrap().hand.unwrap().gesture, Some(Gesture::OpenPalm));
+        s.set_hands(false);
+        assert!(s.hands.is_none(), "the models are freed");
+        assert!(s.sample().unwrap().hand.is_none());
+        s.set_hands(true);
+        assert_eq!(loads.get(), 2);
+        assert!(s.sample().unwrap().hand.is_some());
+    }
+
+    #[test]
+    fn missing_hand_models_leave_hands_empty_without_retrying() {
+        let loads = Rc::new(Cell::new(0));
+        let counter = loads.clone();
+        let mut s = sampler().with_hand_loader(move || {
+            counter.set(counter.get() + 1);
+            None::<FakeHands>
+        });
+        s.set_hands(true);
+        s.set_hands(true);
+        assert!(s.sample().unwrap().hand.is_none());
+        assert_eq!(loads.get(), 1);
+    }
+
+    #[test]
+    fn a_hand_model_error_is_not_followed_by_a_reload() {
+        let loads = Rc::new(Cell::new(0));
+        let counter = loads.clone();
+        let mut s = sampler().with_hand_loader(move || {
+            counter.set(counter.get() + 1);
+            Some(FakeHands { landmarks: None })
+        });
+        s.set_hands(true);
+        assert!(s.sample().unwrap().hand.is_none());
+        s.set_hands(true);
+        assert!(s.sample().unwrap().hand.is_none());
+        assert_eq!(loads.get(), 1);
     }
 
     #[test]

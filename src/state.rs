@@ -1,5 +1,5 @@
-//! Runtime state that survives restarts: the adaptive centroids switch and
-//! what adaptive learning has learned so far.
+//! Runtime state that survives restarts: the adaptive centroids and gestures
+//! switches, and what adaptive learning has learned so far.
 //!
 //! Lives in `$XDG_STATE_HOME/lookfocus/state.json` (usually
 //! `~/.local/state/lookfocus/`), apart from your settings, because the daemon
@@ -27,6 +27,9 @@ pub struct State {
     /// Adaptive centroids switched on or off at run time. `None` means use
     /// the setting in config.toml.
     pub adaptive: Option<bool>,
+    /// Gestures switched on or off at run time. `None` means use the setting
+    /// in config.toml.
+    pub gestures: Option<bool>,
     /// The `created` stamp of the calibration the learned centroids belong
     /// to. A new calibration starts learning from scratch.
     pub calibration: String,
@@ -74,11 +77,16 @@ mod tests {
         assert_eq!(State::load(&path), State::default());
         let s = State {
             adaptive: Some(true),
+            gestures: Some(true),
             calibration: "2026-10-08T07:50:00".into(),
             learned: Some(vec![Centroid { monitor: "DP-1".into(), yaw: 38.0, pitch: 0.5 }]),
         };
         s.save(&path).unwrap();
         assert_eq!(State::load(&path), s);
+        // A file from before gestures existed still loads.
+        std::fs::write(&path, r#"{"adaptive":true,"calibration":"x"}"#).unwrap();
+        assert_eq!(State::load(&path).gestures, None);
+        s.save(&path).unwrap();
         assert!(s.learned_for("2026-10-08T07:50:00").is_some());
         assert!(s.learned_for("another calibration").is_none());
         std::fs::write(&path, "{not json").unwrap();

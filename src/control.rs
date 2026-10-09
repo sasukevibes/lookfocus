@@ -6,7 +6,7 @@
 //! exception: it keeps the connection open and streams events as JSON lines.
 //!
 //! Commands: `status`, `pause`, `resume`, `toggle`, `adaptive on|off|toggle|reset`,
-//! `reload` (read calibration.toml again), `watch`.
+//! `gestures on|off|toggle`, `reload` (read calibration.toml again), `watch`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::events::Event;
+use crate::gesture::Gesture;
 
 pub fn socket_path() -> PathBuf {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
@@ -32,6 +33,13 @@ pub enum AdaptiveCommand {
     Reset,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GesturesCommand {
+    On,
+    Off,
+    Toggle,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Status,
@@ -39,6 +47,7 @@ pub enum Command {
     Resume,
     Toggle,
     Adaptive(AdaptiveCommand),
+    Gestures(GesturesCommand),
     /// Read the calibration file again, after recalibrating.
     Reload,
     Watch,
@@ -58,6 +67,9 @@ impl Command {
             ["adaptive", "off"] => Command::Adaptive(AdaptiveCommand::Off),
             ["adaptive", "toggle"] => Command::Adaptive(AdaptiveCommand::Toggle),
             ["adaptive", "reset"] => Command::Adaptive(AdaptiveCommand::Reset),
+            ["gestures", "on"] => Command::Gestures(GesturesCommand::On),
+            ["gestures", "off"] => Command::Gestures(GesturesCommand::Off),
+            ["gestures", "toggle"] => Command::Gestures(GesturesCommand::Toggle),
             _ => return Err(format!("unknown command {line:?}")),
         })
     }
@@ -80,6 +92,14 @@ pub struct Status {
     /// True while the camera is open.
     pub camera: bool,
     pub adaptive: bool,
+    /// True while gestures are switched on. The camera stays open for them
+    /// even while focus tracking is paused.
+    #[serde(default)]
+    pub gestures: bool,
+    /// The gesture the hand in view shows right now. None for no hand, or a
+    /// hand showing no known gesture. Always None while gestures are off.
+    #[serde(default)]
+    pub gesture: Option<Gesture>,
     /// True while a recent mouse move is holding switching.
     pub mouse_hold: bool,
     /// Degrees each centroid has drifted through adaptive learning.
@@ -184,6 +204,10 @@ mod tests {
         assert_eq!(Command::parse("status"), Ok(Command::Status));
         assert_eq!(Command::parse("  toggle \n"), Ok(Command::Toggle));
         assert_eq!(Command::parse("adaptive reset"), Ok(Command::Adaptive(AdaptiveCommand::Reset)));
+        assert_eq!(Command::parse("gestures on"), Ok(Command::Gestures(GesturesCommand::On)));
+        assert_eq!(Command::parse("gestures toggle"), Ok(Command::Gestures(GesturesCommand::Toggle)));
+        assert!(Command::parse("gestures").is_err());
+        assert!(Command::parse("gestures reset").is_err());
         assert!(Command::parse("adaptive maybe").is_err());
         assert!(Command::parse("").is_err());
     }
