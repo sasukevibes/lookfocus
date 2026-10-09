@@ -17,12 +17,16 @@
 //!
 //! Only the open palm (all five fingers extended) is defined so far.
 
+use serde::{Deserialize, Serialize};
+
 use crate::vision::hand::{
     INDEX_PIP, INDEX_TIP, MIDDLE_PIP, MIDDLE_TIP, NUM_HAND_LANDMARKS, PINKY_MCP, PINKY_PIP, PINKY_TIP, RING_PIP,
     RING_TIP, THUMB_IP, THUMB_TIP, WRIST,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Config files name gestures in snake_case, for example `open_palm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Gesture {
     /// All five fingers extended.
     OpenPalm,
@@ -162,6 +166,13 @@ mod tests {
         // The other hand: mirror left to right.
         let mirrored: Vec<_> = open.iter().map(|q| [640.0 - q[0], q[1], q[2]]).collect();
         assert_eq!(classify(&mirrored), Some(Gesture::OpenPalm));
+    }
+
+    #[test]
+    fn gesture_names_are_snake_case() {
+        assert_eq!(serde_json::to_string(&Gesture::OpenPalm).unwrap(), "\"open_palm\"");
+        assert_eq!(serde_json::from_str::<Gesture>("\"open_palm\"").unwrap(), Gesture::OpenPalm);
+        assert!(serde_json::from_str::<Gesture>("\"OpenPalm\"").is_err());
     }
 
     #[test]

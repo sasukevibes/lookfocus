@@ -414,7 +414,7 @@ mod tests {
                 tracked: true,
                 luma: 120.0,
             });
-            Ok(Sample { time: self.t, face, capture: Duration::ZERO, inference: Duration::ZERO })
+            Ok(Sample { time: self.t, face, hand: None, capture: Duration::ZERO, inference: Duration::ZERO })
         }
     }
 

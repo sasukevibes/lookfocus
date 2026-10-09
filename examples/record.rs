@@ -120,7 +120,7 @@ fn main() -> Result<()> {
     models::init_onnxruntime()?;
     let tracker = FaceTracker::new(OnnxDetector::load(&dir, 1)?, OnnxFaceMesh::load(&dir, 1)?);
     let camera = V4lCamera::open(std::path::Path::new("/dev/video0"), 640, 480, 15.0)?;
-    let mut sampler = Sampler::new(camera, tracker);
+    let mut sampler = Sampler::new(camera, tracker).with_hands(models::load_hand_tracker(&dir, 1));
     let start = Instant::now();
 
     // Let auto exposure settle.

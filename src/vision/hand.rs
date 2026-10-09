@@ -95,6 +95,15 @@ pub struct Hand {
     pub tracked: bool,
 }
 
+/// Anything that finds a hand in a frame: the live `HandTracker`, or a fake in
+/// tests.
+pub trait HandSource {
+    fn process(&mut self, frame: &RgbImage) -> Result<Option<Hand>>;
+
+    /// Forgets any tracked hand.
+    fn reset(&mut self);
+}
+
 pub struct HandTracker<D, L> {
     detector: D,
     landmarker: L,
@@ -149,6 +158,16 @@ impl<D: PalmDetector, L: HandLandmarker> HandTracker<D, L> {
         let landmarks = project(&out.points, &roi, HAND_INPUT_SIZE);
         self.roi = Some(roi_from_hand_landmarks(&landmarks));
         Ok(Some(Hand { landmarks, confidence: out.confidence, handedness: out.handedness, roi, tracked }))
+    }
+}
+
+impl<D: PalmDetector, L: HandLandmarker> HandSource for HandTracker<D, L> {
+    fn process(&mut self, frame: &RgbImage) -> Result<Option<Hand>> {
+        HandTracker::process(self, frame)
+    }
+
+    fn reset(&mut self) {
+        HandTracker::reset(self);
     }
 }
 

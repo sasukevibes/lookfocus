@@ -8,6 +8,7 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ort::session::Session;
@@ -19,7 +20,8 @@ use crate::vision::detector::{self, Anchor, Detection, Letterbox};
 use crate::vision::hand::{self, HAND_INPUT_SIZE, NUM_HAND_LANDMARKS};
 use crate::vision::palm::{self, PalmDetection};
 use crate::vision::{
-    FaceDetector, FaceMesh, HandLandmarker, HandOutput, MESH_INPUT_SIZE, MeshOutput, NUM_LANDMARKS, PalmDetector, Roi,
+    FaceDetector, FaceMesh, HandLandmarker, HandOutput, HandTracker, MESH_INPUT_SIZE, MeshOutput, NUM_LANDMARKS,
+    PalmDetector, Roi,
 };
 
 pub const DETECTOR_FILE: &str = "face_detector.onnx";
@@ -67,6 +69,35 @@ pub fn find_model_dir(explicit: Option<&Path>) -> Result<PathBuf> {
 /// so `find_model_dir` only requires the face models.
 pub fn has_hand_models(dir: &Path) -> bool {
     dir.join(HAND_DETECTOR_FILE).is_file() && dir.join(HAND_LANDMARKS_FILE).is_file()
+}
+
+pub type OnnxHandTracker = HandTracker<OnnxPalmDetector, OnnxHandLandmarker>;
+
+/// Loads the hand models from `dir` if they are there. Without them, or if
+/// they fail to load, it returns None and logs a warning, once per process
+/// since the daemon reopens the camera after every pause. Face tracking does
+/// not need the hand models.
+pub fn load_hand_tracker(dir: &Path, threads: usize) -> Option<OnnxHandTracker> {
+    static WARNED: Once = Once::new();
+    let warn = |msg: String| WARNED.call_once(|| log::warn!("{msg}"));
+    if !has_hand_models(dir) {
+        warn(format!(
+            "hand tracking is off: {HAND_DETECTOR_FILE} and {HAND_LANDMARKS_FILE} are not in {}. \
+             Download them with: scripts/fetch-models.sh",
+            dir.display()
+        ));
+        return None;
+    }
+    let load = || -> Result<OnnxHandTracker> {
+        Ok(HandTracker::new(OnnxPalmDetector::load(dir, threads)?, OnnxHandLandmarker::load(dir, threads)?))
+    };
+    match load() {
+        Ok(tracker) => Some(tracker),
+        Err(e) => {
+            warn(format!("hand tracking is off: {e:#}"));
+            None
+        }
+    }
 }
 
 /// Loads the system ONNX Runtime library. Call once before creating models.

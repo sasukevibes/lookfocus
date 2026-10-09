@@ -18,7 +18,7 @@ use anyhow::Result;
 
 use crate::image::RgbImage;
 use detector::{Detection, LEFT_EYE, RIGHT_EYE};
-pub use hand::{Hand, HandLandmarker, HandOutput, HandTracker, PalmDetector};
+pub use hand::{Hand, HandLandmarker, HandOutput, HandSource, HandTracker, PalmDetector};
 pub use roi::Roi;
 
 /// Side length of the landmark model's square input.

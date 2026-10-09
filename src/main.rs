@@ -139,7 +139,7 @@ fn open_sampler(settings: &Settings, model_dir: &Path) -> Result<LiveSampler> {
     let threads = settings.camera.threads;
     let tracker = FaceTracker::new(OnnxDetector::load(model_dir, threads)?, OnnxFaceMesh::load(model_dir, threads)?);
     let camera = V4lCamera::open(&settings.camera.device, 640, 480, settings.camera.fps)?;
-    Ok(Sampler::new(camera, tracker))
+    Ok(Sampler::new(camera, tracker).with_hands(models::load_hand_tracker(model_dir, threads)))
 }
 
 fn calibration_path() -> PathBuf {

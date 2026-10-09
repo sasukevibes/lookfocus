@@ -352,8 +352,23 @@ The camera is the laptop's integrated UVC camera (`uvcvideo`,
   thumb also needs its tip farther than its IP joint from the little finger's
   base, which catches a thumb folded across the palm. Only x and y are used.
   The open palm (all five extended) is the only gesture so far.
-- Hand tracking is not wired into the daemon yet, and the hand models are
-  optional: `find_model_dir` still needs only the face models.
+- The hand models are optional: `find_model_dir` still needs only the face
+  models. `models::load_hand_tracker` returns None without them and logs one
+  warning per process (the daemon reopens the camera after every pause).
+- Wiring: `Sampler` holds an optional hand tracker (`with_hands`), and each
+  `Sample` has `hand: Option<HandSample>` with the gesture, the hand
+  confidence and the handedness score. It is always None without the hand
+  models. Every live sampler (`run`, `calibrate`, `debug`, the record
+  example) gets hands when the models are there.
+- A hand model error at run time logs a warning and turns hand tracking off
+  for that sampler instead of failing the sample. The hand output layout is
+  still unverified, and a wrong guess must not stop focus switching.
+- Nothing acts on gestures yet, and daemon behavior is unchanged. A later
+  branch connects gestures to actions. `Gesture` serializes in snake_case
+  (`open_palm`) so config can name it.
+- Cost to check on the first real run: with no hand in view, the palm
+  detector runs on one frame in four in every live sampler, including the
+  daemon's.
 
 ### Release (2026-10-08)
 

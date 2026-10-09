@@ -802,7 +802,7 @@ mod tests {
                 tracked: true,
                 luma: 100.0,
             });
-            Ok(Sample { time: t, face, capture: Duration::ZERO, inference: Duration::ZERO })
+            Ok(Sample { time: t, face, hand: None, capture: Duration::ZERO, inference: Duration::ZERO })
         }
         fn set_fps(&mut self, fps: f32) {
             self.0.borrow_mut().fps.push(fps);
