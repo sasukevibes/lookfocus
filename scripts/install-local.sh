@@ -2,7 +2,7 @@
 # Installs lookfocus for the current user, without a package:
 #
 #   - the binary to ~/.local/bin/lookfocus
-#   - the ONNX models to ~/.local/share/lookfocus/models
+#   - the ONNX models (face and hand) to ~/.local/share/lookfocus/models
 #   - a systemd user service, enabled for the graphical session
 #   - the Omarchy bar widget to ~/.config/omarchy/plugins/lookfocus (if
 #     Omarchy is installed)
