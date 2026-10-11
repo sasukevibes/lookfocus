@@ -11,8 +11,16 @@
 //! - the last firing was at least `cooldown` ago. A gesture held through the
 //!   cooldown fires when it ends.
 //!
-//! The trigger takes one sample at a time with its time, so tests drive it with
-//! made-up times.
+//! That is `Trigger`, for toggle mode: a held gesture fires once. Hold mode
+//! ("hold to talk") uses `HoldTrigger` instead. A hold starts under the same
+//! rules (held for `hold`, a face in view, `cooldown` since the last start) and
+//! then stays on for as long as the gesture is held. It ends once the gesture
+//! has been gone for `release`, so a frame or two without the hand does not end
+//! it. The face is needed only to start: while a hold is on, losing the face
+//! changes nothing.
+//!
+//! The triggers take one sample at a time with its time, so tests drive them
+//! with made-up times.
 
 use std::time::{Duration, Instant};
 
@@ -89,6 +97,92 @@ impl Trigger {
     pub fn reset(&mut self) {
         self.held = None;
         self.spent = None;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HoldParams {
+    /// How long a gesture must be held before the hold starts.
+    pub hold: Duration,
+    /// How long the gesture must be gone before the hold ends.
+    pub release: Duration,
+    /// The least time between two starts.
+    pub cooldown: Duration,
+    /// Start a hold only while a face is in view.
+    pub require_face: bool,
+}
+
+/// What a sample did to a hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldEvent {
+    Started(Gesture),
+    Ended(Gesture),
+}
+
+/// A hold that has started and not ended.
+struct Active {
+    gesture: Gesture,
+    /// When the gesture went missing, if it has.
+    gone_since: Option<Instant>,
+}
+
+pub struct HoldTrigger {
+    params: HoldParams,
+    /// The gesture being held toward a start, and when that began.
+    held: Option<(Gesture, Instant)>,
+    active: Option<Active>,
+    last_started: Option<Instant>,
+}
+
+impl HoldTrigger {
+    pub fn new(params: HoldParams) -> Self {
+        Self { params, held: None, active: None, last_started: None }
+    }
+
+    /// Feeds one sample, as `Trigger::update` does. Returns whether a hold
+    /// started or ended on it.
+    pub fn update(&mut self, now: Instant, seen: Option<Gesture>, face: bool) -> Option<HoldEvent> {
+        if let Some(active) = &mut self.active {
+            if seen == Some(active.gesture) {
+                active.gone_since = None;
+                return None;
+            }
+            if now.duration_since(*active.gone_since.get_or_insert(now)) < self.params.release {
+                return None;
+            }
+            return self.end().map(HoldEvent::Ended);
+        }
+
+        let counted = seen.filter(|_| face || !self.params.require_face);
+        match (counted, self.held) {
+            (Some(g), Some((held, _))) if g == held => {}
+            (Some(g), _) => self.held = Some((g, now)),
+            (None, _) => self.held = None,
+        }
+
+        let (gesture, since) = self.held?;
+        let held_long_enough = now.duration_since(since) >= self.params.hold;
+        let cooled = self.last_started.is_none_or(|t| now.duration_since(t) >= self.params.cooldown);
+        if !(held_long_enough && cooled) {
+            return None;
+        }
+        self.held = None;
+        self.last_started = Some(now);
+        self.active = Some(Active { gesture, gone_since: None });
+        Some(HoldEvent::Started(gesture))
+    }
+
+    /// The gesture of the hold that is on, if one is.
+    pub fn active(&self) -> Option<Gesture> {
+        self.active.as_ref().map(|a| a.gesture)
+    }
+
+    /// Ends the hold that is on now, whatever the camera sees, and forgets any
+    /// gesture being held toward a start. Returns the gesture of the hold it
+    /// ended, so its stop command can run. The cooldown stays.
+    pub fn end(&mut self) -> Option<Gesture> {
+        self.held = None;
+        self.active.take().map(|a| a.gesture)
     }
 }
 
@@ -253,5 +347,154 @@ mod tests {
         assert_eq!(r.palm(10), 1);
         r.trigger.reset();
         assert_eq!(r.palm(10), 0, "still cooling down");
+    }
+
+    // ------------------------------------------------------------ hold
+
+    fn hold_params() -> HoldParams {
+        HoldParams {
+            hold: Duration::from_millis(400),
+            release: Duration::from_millis(500),
+            cooldown: Duration::from_millis(1500),
+            require_face: true,
+        }
+    }
+
+    /// A hold trigger with a clock that moves one frame per sample.
+    struct HoldRun {
+        t: Instant,
+        trigger: HoldTrigger,
+    }
+
+    impl HoldRun {
+        fn new(params: HoldParams) -> Self {
+            Self { t: Instant::now(), trigger: HoldTrigger::new(params) }
+        }
+
+        /// Feeds `frames` identical samples and returns what happened.
+        fn feed(&mut self, seen: Option<Gesture>, face: bool, frames: usize) -> Vec<HoldEvent> {
+            (0..frames)
+                .filter_map(|_| {
+                    self.t += FRAME;
+                    self.trigger.update(self.t, seen, face)
+                })
+                .collect()
+        }
+
+        fn palm(&mut self, frames: usize) -> Vec<HoldEvent> {
+            self.feed(Some(Gesture::OpenPalm), true, frames)
+        }
+
+        fn nothing(&mut self, frames: usize) -> Vec<HoldEvent> {
+            self.feed(None, true, frames)
+        }
+    }
+
+    const STARTED: HoldEvent = HoldEvent::Started(Gesture::OpenPalm);
+    const ENDED: HoldEvent = HoldEvent::Ended(Gesture::OpenPalm);
+
+    #[test]
+    fn a_hold_starts_after_the_hold_time_and_lasts_while_held() {
+        let mut r = HoldRun::new(hold_params());
+        assert_eq!(r.palm(7), vec![]);
+        assert_eq!(r.palm(1), vec![STARTED]);
+        assert_eq!(r.trigger.active(), Some(Gesture::OpenPalm));
+        // Held for a long while: nothing more happens.
+        assert_eq!(r.palm(300), vec![]);
+        assert_eq!(r.trigger.active(), Some(Gesture::OpenPalm));
+    }
+
+    #[test]
+    fn a_hold_ends_once_the_gesture_has_been_gone_for_the_release_time() {
+        let mut r = HoldRun::new(hold_params());
+        assert_eq!(r.palm(20), vec![STARTED]);
+        // The first frame without it starts the release; 7 frames later is 462 ms.
+        assert_eq!(r.nothing(8), vec![]);
+        assert_eq!(r.nothing(1), vec![ENDED]);
+        assert_eq!(r.trigger.active(), None);
+        assert_eq!(r.nothing(30), vec![]);
+    }
+
+    #[test]
+    fn a_short_palm_does_not_start_a_hold() {
+        let mut r = HoldRun::new(hold_params());
+        assert_eq!(r.palm(5), vec![]);
+        assert_eq!(r.nothing(30), vec![]);
+        assert_eq!(r.trigger.active(), None);
+    }
+
+    #[test]
+    fn a_brief_loss_of_the_hand_does_not_end_a_hold() {
+        let mut r = HoldRun::new(hold_params());
+        assert_eq!(r.palm(10), vec![STARTED]);
+        for _ in 0..5 {
+            assert_eq!(r.nothing(5), vec![]); // 330 ms
+            assert_eq!(r.palm(10), vec![]);
+        }
+        // A hand showing something else is the same as no hand.
+        assert_eq!(r.nothing(6), vec![]);
+        assert_eq!(r.trigger.active(), Some(Gesture::OpenPalm));
+    }
+
+    #[test]
+    fn the_face_is_needed_to_start_and_not_to_keep_a_hold() {
+        let mut r = HoldRun::new(hold_params());
+        assert_eq!(r.feed(Some(Gesture::OpenPalm), false, 60), vec![]);
+        assert_eq!(r.palm(8), vec![STARTED]);
+        // The palm covers the face for a long time: the hold stays on.
+        assert_eq!(r.feed(Some(Gesture::OpenPalm), false, 200), vec![]);
+        // And the release works without a face too.
+        assert_eq!(r.feed(None, false, 9), vec![ENDED]);
+    }
+
+    #[test]
+    fn a_hold_can_start_without_a_face_when_not_required() {
+        let mut r = HoldRun::new(HoldParams { require_face: false, ..hold_params() });
+        assert_eq!(r.feed(Some(Gesture::OpenPalm), false, 8), vec![STARTED]);
+    }
+
+    #[test]
+    fn the_cooldown_spaces_starts() {
+        let mut r = HoldRun::new(HoldParams { cooldown: Duration::from_secs(3), ..hold_params() });
+        assert_eq!(r.palm(8), vec![STARTED]);
+        assert_eq!(r.nothing(9), vec![ENDED]); // about 1.1 s after the start
+        // Held long enough again, but the cooldown is not over until about
+        // 3 s after the start: it starts then, while still held.
+        let events = r.palm(40);
+        assert_eq!(events, vec![STARTED]);
+        let mut r = HoldRun::new(HoldParams { cooldown: Duration::from_secs(3), ..hold_params() });
+        assert_eq!(r.palm(8), vec![STARTED]);
+        assert_eq!(r.nothing(9), vec![ENDED]);
+        assert_eq!(r.palm(20), vec![], "1.3 s more is still inside the cooldown");
+    }
+
+    #[test]
+    fn a_new_hold_needs_the_full_hold_time_again() {
+        let mut r = HoldRun::new(HoldParams { cooldown: Duration::ZERO, ..hold_params() });
+        assert_eq!(r.palm(8), vec![STARTED]);
+        assert_eq!(r.nothing(9), vec![ENDED]);
+        assert_eq!(r.palm(7), vec![]);
+        assert_eq!(r.palm(1), vec![STARTED]);
+    }
+
+    #[test]
+    fn end_stops_a_hold_at_once_and_says_which() {
+        let mut r = HoldRun::new(HoldParams { cooldown: Duration::ZERO, ..hold_params() });
+        assert_eq!(r.trigger.end(), None);
+        assert_eq!(r.palm(8), vec![STARTED]);
+        assert_eq!(r.trigger.end(), Some(Gesture::OpenPalm));
+        assert_eq!(r.trigger.active(), None);
+        assert_eq!(r.trigger.end(), None, "only once");
+        // A palm still up after that has to be held again to start again.
+        assert_eq!(r.palm(7), vec![]);
+        assert_eq!(r.palm(1), vec![STARTED]);
+    }
+
+    #[test]
+    fn end_keeps_the_cooldown() {
+        let mut r = HoldRun::new(hold_params());
+        assert_eq!(r.palm(8), vec![STARTED]);
+        r.trigger.end();
+        assert_eq!(r.palm(10), vec![], "still cooling down");
     }
 }

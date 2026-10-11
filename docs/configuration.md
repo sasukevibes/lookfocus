@@ -12,7 +12,7 @@ Two other files are written by lookfocus itself. Do not edit them by hand:
 | File | Written by | Contents |
 |---|---|---|
 | `~/.config/lookfocus/calibration.toml` | `lookfocus calibrate` | Head pose per monitor, the monitor layout, look-down threshold |
-| `~/.local/state/lookfocus/state.json` | the daemon | The adaptive centroids and gestures switches, and what adaptive learning learned |
+| `~/.local/state/lookfocus/state.json` | the daemon | The adaptive centroids and gestures switches, the gesture mode, and what adaptive learning learned |
 
 ## Full example with defaults
 
@@ -56,9 +56,17 @@ enabled = false          # the bar menu and `lookfocus gestures` override this
 hold_ms = 400            # how long a gesture must be held before it counts
 cooldown_ms = 1500       # the least time between two firings
 require_face = true      # count a gesture only while your face is in view
+mode = "toggle"          # "toggle": holding runs the command once
+                         # "hold": hold to talk, start and stop commands
+                         # `lookfocus gestures mode` overrides this
+release_ms = 500         # hold mode: how long a gesture must be gone to end
 
-[gestures.actions]       # gesture name = shell command, run with sh -c
+[gestures.actions]       # toggle mode: gesture name = shell command (sh -c)
 open_palm = "voxtype record toggle"
+
+[gestures.hold_actions.open_palm]   # hold mode: one table per gesture
+start = "voxtype record start"      # when the hold starts
+stop = "voxtype record stop"        # when it ends
 
 [filter]                 # One Euro filter on yaw and pitch
 min_cutoff = 1.0         # Hz. Lower is smoother when still, but laggier
@@ -85,6 +93,26 @@ d_cutoff = 1.0           # Hz, for the speed estimate
   so far is `open_palm`. A name that does not exist is an error. Setting a
   command to an empty string turns the action off for that gesture. If you
   write the table, it replaces the default, so list every action you want.
+- `mode` picks what holding a gesture does. In `toggle` mode it runs the
+  gesture's command from `[gestures.actions]` once. In `hold` mode it runs
+  `start` from `[gestures.hold_actions.<gesture>]` when the hold starts and
+  `stop` when it ends. Like `enabled`, `mode` is only the starting value: the
+  bar menu and `lookfocus gestures mode hold|toggle` keep their choice in
+  `state.json` (the `mode` entry), which wins over the config.
+- In hold mode a hold starts under the same rules as a toggle firing
+  (`hold_ms`, `require_face`, and `cooldown_ms` between starts). Once on, it
+  lasts until the gesture has been gone for `release_ms`. Losing your face
+  while it is on does not end it, and a gap in the hand shorter than
+  `release_ms` does not either. Raise `release_ms` if a hold ends while your
+  hand is still up; lower it if the stop feels late.
+- A hold that is on always ends with its `stop` command: when the camera
+  closes, when nobody has been in view for `away_after_s`, when gestures are
+  switched off, when the mode changes, on `lookfocus reload` (and so after
+  recalibrating), and when the daemon stops (SIGTERM, Ctrl+C, or a crash that
+  unwinds). Only a hard kill (SIGKILL) or a power cut can skip it.
+- Each `[gestures.hold_actions.<gesture>]` table needs both `start` and
+  `stop`, so a start is never configured without its stop. An empty string
+  runs nothing. Writing any `hold_actions` table replaces the default.
 - Commands run with `sh -c` as you, from the daemon's environment. They are not
   waited for. One that cannot start, or exits with a nonzero status, is logged.
 - The camera stays open while gestures are on, including while focus tracking
@@ -103,6 +131,8 @@ d_cutoff = 1.0           # Hz, for the speed estimate
 - **The cursor should stay where Hyprland puts it**: set `cursor = "hyprland"`.
 - **A gesture fires by accident**: raise `hold_ms` (600 is still quick) or
   `cooldown_ms`.
+- **Hold to talk stops while your hand is still up**: raise `release_ms`
+  (800 rides out longer gaps in hand tracking).
 - **A gesture is slow to fire**: lower `hold_ms`, and check that `fps` is not
   very low, since the hand is found on one frame in four while no hand is in
   view.

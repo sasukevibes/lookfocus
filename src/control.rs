@@ -6,7 +6,7 @@
 //! exception: it keeps the connection open and streams events as JSON lines.
 //!
 //! Commands: `status`, `pause`, `resume`, `toggle`, `adaptive on|off|toggle|reset`,
-//! `gestures on|off|toggle`, `reload` (read calibration.toml again), `watch`.
+//! `gestures on|off|toggle`, `gestures mode hold|toggle`, `reload` (read calibration.toml again), `watch`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -17,6 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::config::GestureMode;
 use crate::events::Event;
 use crate::gesture::Gesture;
 
@@ -38,6 +39,8 @@ pub enum GesturesCommand {
     On,
     Off,
     Toggle,
+    /// Switch between toggle mode and hold mode.
+    Mode(GestureMode),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +73,8 @@ impl Command {
             ["gestures", "on"] => Command::Gestures(GesturesCommand::On),
             ["gestures", "off"] => Command::Gestures(GesturesCommand::Off),
             ["gestures", "toggle"] => Command::Gestures(GesturesCommand::Toggle),
+            ["gestures", "mode", "hold"] => Command::Gestures(GesturesCommand::Mode(GestureMode::Hold)),
+            ["gestures", "mode", "toggle"] => Command::Gestures(GesturesCommand::Mode(GestureMode::Toggle)),
             _ => return Err(format!("unknown command {line:?}")),
         })
     }
@@ -100,6 +105,14 @@ pub struct Status {
     /// hand showing no known gesture. Always None while gestures are off.
     #[serde(default)]
     pub gesture: Option<Gesture>,
+    /// What holding a gesture does: `toggle` runs its command once, `hold`
+    /// runs a start command and, when you let go, a stop command.
+    #[serde(default)]
+    pub gesture_mode: GestureMode,
+    /// True while a hold is on in hold mode, so its stop command is still to
+    /// come.
+    #[serde(default)]
+    pub holding: bool,
     /// True while a recent mouse move is holding switching.
     pub mouse_hold: bool,
     /// Degrees each centroid has drifted through adaptive learning.
@@ -208,6 +221,17 @@ mod tests {
         assert_eq!(Command::parse("gestures toggle"), Ok(Command::Gestures(GesturesCommand::Toggle)));
         assert!(Command::parse("gestures").is_err());
         assert!(Command::parse("gestures reset").is_err());
+        assert_eq!(
+            Command::parse("gestures mode hold"),
+            Ok(Command::Gestures(GesturesCommand::Mode(GestureMode::Hold)))
+        );
+        assert_eq!(
+            Command::parse(" gestures  mode toggle\n"),
+            Ok(Command::Gestures(GesturesCommand::Mode(GestureMode::Toggle)))
+        );
+        assert!(Command::parse("gestures mode").is_err());
+        assert!(Command::parse("gestures mode push").is_err());
+        assert!(Command::parse("gestures mode hold now").is_err());
         assert!(Command::parse("adaptive maybe").is_err());
         assert!(Command::parse("").is_err());
     }

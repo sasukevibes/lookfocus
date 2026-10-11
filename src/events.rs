@@ -10,6 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use serde::Serialize;
 
+use crate::config::GestureMode;
 use crate::gesture::Gesture;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -60,6 +61,25 @@ pub enum Event {
     Gesture {
         gesture: Gesture,
         command: Option<String>,
+    },
+    /// The gesture mode was switched between toggle and hold.
+    GestureModeChanged {
+        mode: GestureMode,
+    },
+    /// In hold mode, a gesture was held long enough and a hold started.
+    /// `command` is the start command lookfocus ran, or None if none is set.
+    GestureStarted {
+        gesture: Gesture,
+        command: Option<String>,
+    },
+    /// In hold mode, a hold ended. `command` is the stop command lookfocus
+    /// ran, or None if none is set. `reason` is `released` when the gesture
+    /// was gone for `release_ms`, or what else ended it: `camera_closed`,
+    /// `away`, `gestures_off`, `mode_changed`, `reload` or `shutdown`.
+    GestureEnded {
+        gesture: Gesture,
+        command: Option<String>,
+        reason: String,
     },
 }
 
@@ -116,5 +136,21 @@ mod tests {
         assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"event":"gesture","gesture":"open_palm","command":null}"#);
         let e = Event::GesturesChanged { enabled: true };
         assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"event":"gestures_changed","enabled":true}"#);
+        let e = Event::GestureModeChanged { mode: GestureMode::Hold };
+        assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"event":"gesture_mode_changed","mode":"hold"}"#);
+        let e = Event::GestureStarted { gesture: Gesture::OpenPalm, command: Some("voxtype record start".into()) };
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"event":"gesture_started","gesture":"open_palm","command":"voxtype record start"}"#
+        );
+        let e = Event::GestureEnded {
+            gesture: Gesture::OpenPalm,
+            command: Some("voxtype record stop".into()),
+            reason: "released".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"event":"gesture_ended","gesture":"open_palm","command":"voxtype record stop","reason":"released"}"#
+        );
     }
 }

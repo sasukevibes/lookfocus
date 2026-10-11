@@ -26,6 +26,12 @@
 //! Gestures are not affected by 2 and 3. They have their own rules, in
 //! `trigger.rs`.
 //!
+//! In hold mode a gesture runs a start command, and a stop command when it is
+//! let go. The stop command must never be lost, or a recording could run on
+//! forever, so anything that stops the daemon watching the hand also ends a
+//! hold that is on: the camera closing, going away, gestures switched off, the
+//! mode changed, a reload, and the daemon shutting down (even by a panic).
+//!
 //! lookfocus never reads the keyboard. Mouse movement is seen only as cursor
 //! position changes reported by Hyprland, ignoring moves lookfocus made.
 //!
@@ -34,6 +40,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -42,7 +49,7 @@ use anyhow::Result;
 use crate::actions::{ActionRunner, ShellRunner};
 use crate::adaptive::{Adaptive, AdaptiveParams};
 use crate::classify::Classifier;
-use crate::config::{Calibration, CursorMode, Settings};
+use crate::config::{Calibration, CursorMode, GestureMode, Settings};
 use crate::control::{AdaptiveCommand, Command, GesturesCommand, Request, Status};
 use crate::events::{Event, EventBus};
 use crate::filter::PoseFilter;
@@ -51,7 +58,7 @@ use crate::hypr::{Compositor, HyprEvent, Monitor};
 use crate::sampler::{HandSample, PoseSource};
 use crate::state::State;
 use crate::switcher::{Decision, SwitchParams, Switcher, auto_hysteresis};
-use crate::trigger::{Trigger, TriggerParams};
+use crate::trigger::{HoldEvent, HoldParams, HoldTrigger, Trigger, TriggerParams};
 
 /// Opens the pose source (camera plus models). Called again after each
 /// release.
@@ -97,7 +104,12 @@ pub struct Daemon<P, C> {
     adaptive_on: bool,
     /// Gestures switched on or off at run time. `None` follows the settings.
     gestures_choice: Option<bool>,
+    /// The gesture mode chosen at run time. `None` follows the settings.
+    mode_choice: Option<GestureMode>,
+    /// Decides when a gesture fires in toggle mode.
     trigger: Trigger,
+    /// Decides when a hold starts and ends in hold mode.
+    hold_trigger: HoldTrigger,
     runner: Box<dyn ActionRunner>,
     /// Whether the last sample showed a hand, and the gesture it showed.
     hand_seen: bool,
@@ -166,11 +178,12 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         };
         let gestures_on = state.gestures.unwrap_or(settings.gestures.enabled);
         log::info!(
-            "dwell {} ms, hysteresis {hysteresis:.1} degrees, settle speed {} deg/s, adaptive {}, gestures {}",
+            "dwell {} ms, hysteresis {hysteresis:.1} degrees, settle speed {} deg/s, adaptive {}, gestures {} ({} mode)",
             settings.switching.dwell_ms,
             settings.switching.settle_speed,
             if adaptive_on { "on" } else { "off" },
-            if gestures_on { "on" } else { "off" }
+            if gestures_on { "on" } else { "off" },
+            state.mode.unwrap_or(settings.gestures.mode)
         );
         let look_down =
             if settings.overrides.look_down { calibration.look_down.as_ref().map(|l| l.threshold) } else { None };
@@ -199,12 +212,19 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
             adaptive,
             adaptive_on,
             gestures_choice: state.gestures,
+            mode_choice: state.mode,
             trigger: Trigger::new(TriggerParams {
                 hold: Duration::from_millis(settings.gestures.hold_ms),
                 cooldown: Duration::from_millis(settings.gestures.cooldown_ms),
                 require_face: settings.gestures.require_face,
             }),
-            runner: Box::new(ShellRunner),
+            hold_trigger: HoldTrigger::new(HoldParams {
+                hold: Duration::from_millis(settings.gestures.hold_ms),
+                release: Duration::from_millis(settings.gestures.release_ms),
+                cooldown: Duration::from_millis(settings.gestures.cooldown_ms),
+                require_face: settings.gestures.require_face,
+            }),
+            runner: Box::new(ShellRunner::default()),
             hand_seen: false,
             hand_gesture: None,
             state_path,
@@ -251,10 +271,15 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         }
     }
 
-    /// Runs until an unrecoverable error. Hyprland events and control
+    /// Runs until an unrecoverable error, or until `stop` is set (by a signal
+    /// handler), when it shuts down cleanly. Hyprland events and control
     /// requests arrive on their own channels.
-    pub fn run(&mut self, hypr: Receiver<HyprEvent>, control: Receiver<Request>) -> Result<()> {
+    pub fn run(&mut self, hypr: Receiver<HyprEvent>, control: Receiver<Request>, stop: &AtomicBool) -> Result<()> {
         loop {
+            if stop.load(Ordering::SeqCst) {
+                self.shutdown();
+                return Ok(());
+            }
             for e in hypr.try_iter() {
                 if let Err(err) = self.handle_hypr_event(e) {
                     log::warn!("handling a Hyprland event: {err}");
@@ -271,6 +296,19 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
             if self.tick()? == Tick::Idle {
                 std::thread::sleep(Duration::from_millis(200));
             }
+        }
+    }
+
+    /// Ends a hold that is on, saves state and releases the camera. Waits a
+    /// little for the stop command, which would otherwise be killed along
+    /// with the rest of the service.
+    pub fn shutdown(&mut self) {
+        log::info!("shutting down");
+        self.end_hold("shutdown");
+        self.release_camera();
+        self.save_state();
+        if !self.runner.wait(Duration::from_secs(3)) {
+            log::warn!("a gesture command was still running at shutdown");
         }
     }
 
@@ -311,6 +349,8 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
             adaptive: self.adaptive_on,
             gestures: self.gestures_on(),
             gesture: self.hand_gesture,
+            gesture_mode: self.gesture_mode(),
+            holding: self.hold_trigger.active().is_some(),
             mouse_hold: self.mouse_hold_until.is_some_and(|t| now < t),
             drift: names.zip(self.adaptive.drift()).collect(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -347,6 +387,7 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
                     GesturesCommand::On => self.set_gestures(true),
                     GesturesCommand::Off => self.set_gestures(false),
                     GesturesCommand::Toggle => self.set_gestures(!self.gestures_on()),
+                    GesturesCommand::Mode(mode) => self.set_mode(mode),
                 }
                 self.save_state();
             }
@@ -355,8 +396,10 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
     }
 
     /// Swaps in a new calibration, keeping the camera, pause state and
-    /// adaptive switch. Learning restarts for the new calibration.
+    /// adaptive switch. Learning restarts for the new calibration. A hold
+    /// that is on ends, whether or not the reload works.
     pub fn reload(&mut self) -> Result<()> {
+        self.end_hold("reload");
         let path = self.calibration_path.clone().ok_or_else(|| anyhow::anyhow!("no calibration path"))?;
         let calibration = Calibration::load(&path)?.ok_or_else(|| anyhow::anyhow!("{} is missing", path.display()))?;
         self.save_state();
@@ -442,7 +485,7 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         if let Some(s) = self.source.as_mut() {
             s.set_hands(on);
         }
-        self.forget_hand();
+        self.forget_hand("gestures_off");
         if !on && !self.switching_on() {
             // The camera was open for gestures only.
             self.release_camera();
@@ -450,8 +493,27 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         self.events.emit(Event::GesturesChanged { enabled: on });
     }
 
-    /// Drops everything known about the hand and any gesture being held.
-    fn forget_hand(&mut self) {
+    fn gesture_mode(&self) -> GestureMode {
+        self.mode_choice.unwrap_or(self.settings.gestures.mode)
+    }
+
+    fn set_mode(&mut self, mode: GestureMode) {
+        if mode == self.gesture_mode() {
+            return;
+        }
+        self.mode_choice = Some(mode);
+        self.state_dirty = true;
+        log::info!("gesture mode {mode}");
+        // Neither trigger carries over: a palm held now has to be held again.
+        self.end_hold("mode_changed");
+        self.trigger.reset();
+        self.events.emit(Event::GestureModeChanged { mode });
+    }
+
+    /// Drops everything known about the hand and any gesture being held,
+    /// ending a hold that is on for `reason`.
+    fn forget_hand(&mut self, reason: &str) {
+        self.end_hold(reason);
         self.trigger.reset();
         self.hand_seen = false;
         self.hand_gesture = None;
@@ -478,6 +540,7 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         let state = State {
             adaptive: Some(self.adaptive_on),
             gestures: self.gestures_choice,
+            mode: self.mode_choice,
             calibration: self.calibration.created.clone(),
             learned: Some(self.adaptive.centroids().to_vec()),
         };
@@ -565,7 +628,7 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         self.switcher.hold();
         self.warmup_until = None;
         self.still_since = None;
-        self.forget_hand();
+        self.forget_hand("camera_closed");
         if self.face {
             self.face = false;
             self.events.emit(Event::FaceLost);
@@ -669,6 +732,7 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
                 self.away = true;
                 self.next_probe_at = Some(now + self.timing.probe_every);
                 self.events.emit(Event::Away);
+                self.end_hold("away");
                 self.release_camera();
             }
             return Ok(Tick::Sampled(Decision::Stay));
@@ -708,36 +772,35 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
     }
 
     /// Notes what the hand in this sample shows, and runs the gesture's
-    /// command if it has just been held long enough.
+    /// command if it has just been held long enough (toggle mode), or a
+    /// hold's start or stop command (hold mode).
     fn handle_hand(&mut self, time: Instant, face: bool, hand: Option<&HandSample>) {
         if !self.gestures_on() {
             return;
         }
         self.hand_seen = hand.is_some();
         self.hand_gesture = hand.and_then(|h| h.gesture);
-        if let Some(gesture) = self.trigger.update(time, self.hand_gesture, face) {
-            self.fire(gesture);
+        match self.gesture_mode() {
+            GestureMode::Toggle => {
+                if let Some(gesture) = self.trigger.update(time, self.hand_gesture, face) {
+                    self.fire(gesture);
+                }
+            }
+            GestureMode::Hold => match self.hold_trigger.update(time, self.hand_gesture, face) {
+                Some(HoldEvent::Started(gesture)) => {
+                    let start = self.settings.gestures.hold_actions.get(&gesture).map(|a| a.start.clone());
+                    let command = self.launch(gesture, start.as_deref());
+                    self.events.emit(Event::GestureStarted { gesture, command });
+                }
+                Some(HoldEvent::Ended(gesture)) => self.stop_hold(gesture, "released"),
+                None => {}
+            },
         }
     }
 
     fn fire(&mut self, gesture: Gesture) {
-        let command = self
-            .settings
-            .gestures
-            .actions
-            .get(&gesture)
-            .map(|c| c.trim())
-            .filter(|c| !c.is_empty())
-            .map(str::to_string);
-        match &command {
-            Some(c) => {
-                log::info!("{gesture}: running `{c}`");
-                if let Err(e) = self.runner.run(gesture, c) {
-                    log::warn!("the {gesture} command failed to start: {e:#}");
-                }
-            }
-            None => log::info!("{gesture}: no command set"),
-        }
+        let action = self.settings.gestures.actions.get(&gesture).cloned();
+        let command = self.launch(gesture, action.as_deref());
         self.events.emit(Event::Gesture { gesture, command });
     }
 
@@ -817,7 +880,8 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
         let still = matches!(decision, Decision::Stay)
             && speed < self.switcher.params().settle_speed / 2.0
             && !self.mouse_hold_until.is_some_and(|t| now < t)
-            && !self.hand_seen;
+            && !self.hand_seen
+            && self.hold_trigger.active().is_none();
         if still {
             let since = *self.still_since.get_or_insert(now);
             if now.duration_since(since) >= self.timing.idle_after {
@@ -841,6 +905,49 @@ impl<P: PoseSource, C: Compositor> Daemon<P, C> {
     fn save_state_if_due(&mut self, now: Instant) {
         if self.state_dirty && now.duration_since(self.state_saved) >= Duration::from_secs(60) {
             self.save_state();
+        }
+    }
+}
+
+// Not tied to the pose source or compositor, so `Drop` can use them.
+impl<P, C> Daemon<P, C> {
+    /// Ends the hold that is on, if one is, and runs its stop command.
+    fn end_hold(&mut self, reason: &str) {
+        if let Some(gesture) = self.hold_trigger.end() {
+            self.stop_hold(gesture, reason);
+        }
+    }
+
+    fn stop_hold(&mut self, gesture: Gesture, reason: &str) {
+        log::info!("{gesture} hold ended ({reason})");
+        let stop = self.settings.gestures.hold_actions.get(&gesture).map(|a| a.stop.clone());
+        let command = self.launch(gesture, stop.as_deref());
+        self.events.emit(Event::GestureEnded { gesture, command, reason: reason.to_string() });
+    }
+
+    /// Starts `command` for `gesture`, if it is set and not empty. Returns
+    /// what it started, for the event.
+    fn launch(&mut self, gesture: Gesture, command: Option<&str>) -> Option<String> {
+        let command = command.map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
+        match &command {
+            Some(c) => {
+                log::info!("{gesture}: running `{c}`");
+                if let Err(e) = self.runner.run(gesture, c) {
+                    log::warn!("the {gesture} command failed to start: {e:#}");
+                }
+            }
+            None => log::info!("{gesture}: no command set"),
+        }
+        command
+    }
+}
+
+impl<P, C> Drop for Daemon<P, C> {
+    /// The last chance to stop a hold, for example after a panic.
+    fn drop(&mut self) {
+        if self.hold_trigger.active().is_some() {
+            self.end_hold("shutdown");
+            self.runner.wait(Duration::from_secs(3));
         }
     }
 }
@@ -981,6 +1088,8 @@ mod tests {
     struct FakeRunner {
         ran: Rc<RefCell<Vec<(Gesture, String)>>>,
         fail: Rc<Cell<bool>>,
+        /// How many times it was asked to wait for its commands.
+        waits: Rc<Cell<usize>>,
     }
 
     impl ActionRunner for FakeRunner {
@@ -990,6 +1099,10 @@ mod tests {
             }
             self.ran.borrow_mut().push((gesture, command.to_string()));
             Ok(())
+        }
+        fn wait(&mut self, _timeout: Duration) -> bool {
+            self.waits.set(self.waits.get() + 1);
+            true
         }
     }
 
@@ -1088,6 +1201,25 @@ mod tests {
             self.events().into_iter().filter(|e| matches!(e, Event::Gesture { .. })).collect()
         }
 
+        /// Gestures on in hold mode, with a face at DP-2 for every sample.
+        fn hold_mode(hands: Hands) -> Self {
+            let mut settings = Settings::default();
+            settings.gestures.mode = GestureMode::Hold;
+            Self::gestures_with(hold(31.0, 2.0, hands.len()), hands, settings)
+        }
+
+        /// The hold start and end events so far.
+        fn hold_events(&self) -> Vec<Event> {
+            self.events()
+                .into_iter()
+                .filter(|e| matches!(e, Event::GestureStarted { .. } | Event::GestureEnded { .. }))
+                .collect()
+        }
+
+        fn commands(&self) -> Vec<String> {
+            self.ran().into_iter().map(|(_, c)| c).collect()
+        }
+
         fn done(&self) -> bool {
             let s = self.script.borrow();
             s.i >= s.poses.len()
@@ -1135,6 +1267,16 @@ mod tests {
     }
 
     const PALM_COMMAND: &str = "voxtype record toggle";
+    const START: &str = "voxtype record start";
+    const STOP: &str = "voxtype record stop";
+
+    fn started() -> Event {
+        Event::GestureStarted { gesture: Gesture::OpenPalm, command: Some(START.into()) }
+    }
+
+    fn ended(reason: &str) -> Event {
+        Event::GestureEnded { gesture: Gesture::OpenPalm, command: Some(STOP.into()), reason: reason.into() }
+    }
 
     #[test]
     fn looking_at_a_monitor_focuses_it_and_restores_the_cursor() {
@@ -1751,6 +1893,240 @@ mod tests {
         let mut r = Rig::build(hold(31.0, 2.0, 5), calibration(), Settings::default(), Some(path.clone()));
         r.d.handle_command(Command::Adaptive(AdaptiveCommand::On));
         assert_eq!(State::load(&path).gestures, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ------------------------------------------------------------ hold mode
+
+    #[test]
+    fn hold_mode_starts_while_held_and_stops_when_let_go() {
+        let mut r = Rig::hold_mode(cat(&[no_hand(5), palm(60), no_hand(20)]));
+        r.ticks(5 + 10);
+        assert_eq!(r.commands(), vec![START]);
+        assert!(r.d.status().holding);
+        r.ticks(50);
+        assert_eq!(r.commands(), vec![START], "nothing more while held");
+        r.run_all();
+        assert_eq!(r.commands(), vec![START, STOP]);
+        assert!(!r.d.status().holding);
+        assert_eq!(r.hold_events(), vec![started(), ended("released")]);
+        assert!(r.gesture_events().is_empty(), "no toggle firing in hold mode");
+    }
+
+    #[test]
+    fn hold_mode_rides_out_brief_losses_of_hand_and_face() {
+        // A palm that flickers out for 260 ms at a time, with the face lost
+        // (the palm in front of it) for a long stretch in the middle.
+        let hands = cat(&[palm(10), no_hand(4), palm(10), no_hand(4), palm(60), palm(10), no_hand(20)]);
+        let mut poses = hold(31.0, 2.0, 28);
+        poses.extend(vec![None; 60]);
+        poses.extend(hold(31.0, 2.0, 30));
+        let mut settings = Settings::default();
+        settings.gestures.mode = GestureMode::Hold;
+        let mut r = Rig::gestures_with(poses, hands, settings);
+        r.ticks(98);
+        assert_eq!(r.commands(), vec![START]);
+        assert!(r.d.status().holding);
+        r.run_all();
+        assert_eq!(r.commands(), vec![START, STOP]);
+    }
+
+    #[test]
+    fn hold_mode_needs_a_face_to_start() {
+        let mut settings = Settings::default();
+        settings.gestures.mode = GestureMode::Hold;
+        let mut r = Rig::gestures_with(vec![None; 40], palm(40), settings);
+        r.run_all();
+        assert!(r.ran().is_empty());
+    }
+
+    #[test]
+    fn hold_mode_cooldown_spaces_starts() {
+        let mut settings = Settings::default();
+        settings.gestures.mode = GestureMode::Hold;
+        settings.gestures.cooldown_ms = 4000;
+        let hands = cat(&[palm(10), no_hand(10), palm(20), palm(60), no_hand(10)]);
+        let mut r = Rig::gestures_with(hold(31.0, 2.0, hands.len()), hands, settings);
+        r.ticks(10 + 10 + 20); // about 2.6 s after the first start
+        assert_eq!(r.commands(), vec![START, STOP]);
+        r.run_all();
+        assert_eq!(r.commands(), vec![START, STOP, START, STOP]);
+    }
+
+    #[test]
+    fn hold_mode_uses_the_configured_commands() {
+        let mut settings = Settings::default();
+        settings.gestures.mode = GestureMode::Hold;
+        settings
+            .gestures
+            .hold_actions
+            .insert(Gesture::OpenPalm, crate::config::HoldAction { start: "rec on".into(), stop: " ".into() });
+        let hands = cat(&[palm(20), no_hand(20)]);
+        let mut r = Rig::gestures_with(hold(31.0, 2.0, 40), hands, settings);
+        r.run_all();
+        // An empty stop command runs nothing, but the hold still ends.
+        assert_eq!(r.commands(), vec!["rec on"]);
+        let events = r.hold_events();
+        assert_eq!(
+            events.last(),
+            Some(&Event::GestureEnded { gesture: Gesture::OpenPalm, command: None, reason: "released".into() })
+        );
+    }
+
+    /// A hold that is on after about one second of palm, with the palm still up.
+    fn holding_rig(hands: Hands) -> Rig {
+        let mut r = Rig::hold_mode(hands);
+        r.ticks(15);
+        assert_eq!(r.commands(), vec![START]);
+        assert!(r.d.status().holding);
+        r
+    }
+
+    #[test]
+    fn a_hold_stops_when_the_camera_closes() {
+        // Pausing with gestures off releases the camera.
+        let mut r = holding_rig(palm(60));
+        r.d.handle_command(Command::Pause);
+        assert_eq!(r.commands(), vec![START], "gestures still on: the camera stays open");
+        r.d.handle_command(Command::Gestures(GesturesCommand::Off));
+        assert_eq!(r.commands(), vec![START, STOP]);
+        assert!(!r.d.status().camera && !r.d.status().holding);
+
+        // The camera failing mid-stream.
+        let mut r = holding_rig(palm(60));
+        r.d.release_camera();
+        assert_eq!(r.commands(), vec![START, STOP]);
+        assert!(r.hold_events().contains(&ended("camera_closed")));
+    }
+
+    #[test]
+    fn a_hold_stops_when_the_person_goes_away() {
+        let mut settings = Settings::default();
+        settings.gestures.mode = GestureMode::Hold;
+        settings.power.away_after_s = 2;
+        settings.power.probe_every_s = 600;
+        // The face goes and the palm stays up, as if left raised in front of it.
+        let mut poses = hold(31.0, 2.0, 15);
+        poses.extend(vec![None; 60]);
+        let mut r = Rig::gestures_with(poses, palm(75), settings);
+        r.ticks(15);
+        assert_eq!(r.commands(), vec![START]);
+        r.ticks(25);
+        assert_eq!(r.commands(), vec![START], "a second without a face is fine");
+        r.ticks(20);
+        assert_eq!(r.d.status().state, "away");
+        assert_eq!(r.commands(), vec![START, STOP]);
+        assert!(r.hold_events().contains(&ended("away")));
+    }
+
+    #[test]
+    fn a_hold_stops_when_gestures_are_switched_off() {
+        let mut r = holding_rig(palm(60));
+        r.d.handle_command(Command::Gestures(GesturesCommand::Off));
+        assert_eq!(r.commands(), vec![START, STOP]);
+        assert!(r.hold_events().contains(&ended("gestures_off")));
+        r.run_all();
+        assert_eq!(r.commands(), vec![START, STOP]);
+    }
+
+    #[test]
+    fn a_hold_stops_when_the_mode_changes() {
+        let mut r = holding_rig(palm(60));
+        let reply = r.d.handle_command(Command::Gestures(GesturesCommand::Mode(GestureMode::Toggle)));
+        assert!(reply.contains("\"gesture_mode\":\"toggle\"") && reply.contains("\"holding\":false"), "{reply}");
+        assert_eq!(r.commands(), vec![START, STOP]);
+        let events = r.events();
+        assert!(events.contains(&ended("mode_changed")));
+        assert!(events.contains(&Event::GestureModeChanged { mode: GestureMode::Toggle }));
+        // The palm still up has to be held again to fire in toggle mode.
+        r.ticks(5);
+        assert_eq!(r.commands(), vec![START, STOP]);
+        r.run_all();
+        assert_eq!(r.commands(), vec![START, STOP, PALM_COMMAND]);
+    }
+
+    #[test]
+    fn a_hold_stops_on_reload_even_if_it_fails() {
+        let mut r = holding_rig(palm(60));
+        // No calibration path, so the reload itself fails.
+        let reply = r.d.handle_command(Command::Reload);
+        assert!(reply.contains("error"), "{reply}");
+        assert_eq!(r.commands(), vec![START, STOP]);
+        assert!(r.hold_events().contains(&ended("reload")));
+    }
+
+    #[test]
+    fn a_hold_stops_when_the_daemon_shuts_down() {
+        let mut r = holding_rig(palm(60));
+        r.d.shutdown();
+        assert_eq!(r.commands(), vec![START, STOP]);
+        assert!(r.hold_events().contains(&ended("shutdown")));
+        assert!(r.runner.waits.get() >= 1, "waited for the stop command");
+        assert!(!r.d.status().camera);
+
+        // Through `run`, when the stop flag is set.
+        let mut r = holding_rig(palm(60));
+        let (_htx, hrx) = std::sync::mpsc::channel();
+        let (_ctx, crx) = std::sync::mpsc::channel();
+        r.d.run(hrx, crx, &AtomicBool::new(true)).unwrap();
+        assert_eq!(r.commands(), vec![START, STOP]);
+
+        // And when the daemon is dropped without one, as after a panic.
+        let r = holding_rig(palm(60));
+        let runner = r.runner.clone();
+        drop(r);
+        assert_eq!(runner.ran.borrow().iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(), vec![START, STOP]);
+    }
+
+    #[test]
+    fn no_hold_means_no_stop_command() {
+        let mut r = Rig::hold_mode(palm(3));
+        r.ticks(3);
+        r.d.handle_command(Command::Gestures(GesturesCommand::Off));
+        r.d.shutdown();
+        let runner = r.runner.clone();
+        drop(r);
+        assert!(runner.ran.borrow().is_empty());
+    }
+
+    #[test]
+    fn setting_the_mode_to_what_it_already_is_does_nothing() {
+        let mut r = holding_rig(palm(60));
+        r.d.handle_command(Command::Gestures(GesturesCommand::Mode(GestureMode::Hold)));
+        assert_eq!(r.commands(), vec![START]);
+        assert!(r.d.status().holding);
+        assert!(!r.events().iter().any(|e| matches!(e, Event::GestureModeChanged { .. })));
+    }
+
+    #[test]
+    fn the_mode_can_be_switched_to_hold_at_run_time() {
+        let mut r = Rig::gestures(cat(&[no_hand(3), palm(30), no_hand(20)]));
+        assert_eq!(r.d.status().gesture_mode, GestureMode::Toggle);
+        r.d.handle_command(Command::Gestures(GesturesCommand::Mode(GestureMode::Hold)));
+        assert_eq!(r.d.status().gesture_mode, GestureMode::Hold);
+        r.run_all();
+        assert_eq!(r.commands(), vec![START, STOP]);
+        let json: serde_json::Value = serde_json::from_str(&r.d.handle_command(Command::Status)).unwrap();
+        assert_eq!(json["gesture_mode"], "hold");
+        assert_eq!(json["holding"], false);
+    }
+
+    #[test]
+    fn the_mode_is_remembered_between_runs() {
+        let dir = std::env::temp_dir().join(format!("lookfocus-mode-state-{}", std::process::id()));
+        let path = dir.join("state.json");
+        let mut r = Rig::build(hold(31.0, 2.0, 5), calibration(), Settings::default(), Some(path.clone()));
+        r.d.handle_command(Command::Gestures(GesturesCommand::Mode(GestureMode::Hold)));
+        assert_eq!(State::load(&path).mode, Some(GestureMode::Hold));
+        assert_eq!(State::load(&path).gestures, None, "the on/off switch is not pinned");
+        let r2 = Rig::build(hold(31.0, 2.0, 5), calibration(), Settings::default(), Some(path.clone()));
+        assert_eq!(r2.d.status().gesture_mode, GestureMode::Hold);
+        // The saved choice wins over the settings.
+        r.d.handle_command(Command::Gestures(GesturesCommand::Mode(GestureMode::Toggle)));
+        let mut hold_settings = Settings::default();
+        hold_settings.gestures.mode = GestureMode::Hold;
+        let r3 = Rig::build(hold(31.0, 2.0, 5), calibration(), hold_settings, Some(path.clone()));
+        assert_eq!(r3.d.status().gesture_mode, GestureMode::Toggle);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

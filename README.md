@@ -202,6 +202,18 @@ is the open palm (all five fingers spread, facing the camera), and by default
 it runs `voxtype record toggle`, so one palm starts voxtype dictation and the
 next one stops it.
 
+There are two modes:
+
+- **Toggle** (the default): holding a palm up runs its command once.
+- **Hold to talk**: voxtype records while you hold your palm up. Holding it
+  runs `voxtype record start`, and lowering it runs `voxtype record stop`.
+
+Switch mode with the "Hold to talk" switch in the bar menu, or:
+
+```sh
+lookfocus gestures mode hold     # or toggle
+```
+
 Gestures are off by default. Switch them on with the bar menu, or:
 
 ```sh
@@ -222,8 +234,16 @@ How it works:
   camera.
 - A gesture counts after you hold it for 400 ms with your face in view. A hand
   waved across the picture, or raised while you are not there, does nothing.
-- It fires once. To fire it again, lower your hand for half a second, then
-  raise it. Two firings are at least 1.5 seconds apart.
+- In toggle mode it fires once. To fire it again, lower your hand for half a
+  second, then raise it. Two firings are at least 1.5 seconds apart.
+- In hold mode the hold lasts while your palm is up, and ends once it has been
+  gone for half a second (`release_ms`), so a frame or two where the hand is
+  lost does not cut you off. Your face is needed only to start: a palm held in
+  front of your face keeps going. Two starts are at least 1.5 seconds apart.
+- A hold always gets its stop command. If the camera closes, nobody is in
+  view for a while, gestures are switched off, the mode changes, the daemon
+  reloads, or the service stops, lookfocus runs the stop command then, so
+  voxtype is never left recording.
 - The hand models run only while gestures are on. While a hand is in view,
   lookfocus samples at the full rate so it does not miss the gesture.
 - If nobody is in front of the camera for 30 seconds, the camera is released
@@ -237,9 +257,15 @@ enabled = true
 hold_ms = 400
 cooldown_ms = 1500
 require_face = true
+mode = "toggle"         # or "hold"
+release_ms = 500        # hold mode: how long the palm must be gone to stop
 
-[gestures.actions]
+[gestures.actions]      # toggle mode
 open_palm = "voxtype record toggle"
+
+[gestures.hold_actions.open_palm]   # hold mode
+start = "voxtype record start"
+stop = "voxtype record stop"
 ```
 
 Commands run through `sh -c`, so pipes and arguments work. lookfocus does not
@@ -248,7 +274,8 @@ wait for them, and logs one that cannot start or exits with an error (see
 terminal's (it may lack `~/.local/bin`, for one), so give the full path to a
 command that lives somewhere unusual.
 Setting a gesture's command to `""` turns its action off. The `gesture` event
-still goes out for other tools (see [docs/events.md](docs/events.md)).
+(`gesture_started` and `gesture_ended` in hold mode) still goes out for other
+tools (see [docs/events.md](docs/events.md)).
 
 `lookfocus debug` shows the hand and the gesture it sees, whatever the gestures
 setting is, so you can check that the models work.
@@ -265,6 +292,7 @@ setting is, so you can check that the models work.
 | `lookfocus status [--json]` | Show the state, focused monitor and camera |
 | `lookfocus adaptive on\|off\|toggle\|reset` | Control adaptive centroids |
 | `lookfocus gestures on\|off\|toggle` | Switch hand gestures |
+| `lookfocus gestures mode hold\|toggle` | Hold to talk, or run the command once |
 | `lookfocus debug [--json]` | Live pose, hand, zone and what the daemon would do |
 | `lookfocus watch` | Stream events as JSON lines (experimental, see below) |
 
@@ -290,6 +318,7 @@ enabled = false
 [gestures]
 enabled = false         # or switch at run time: lookfocus gestures on
 hold_ms = 400
+mode = "toggle"         # or "hold": lookfocus gestures mode hold
 
 [gestures.actions]
 open_palm = "voxtype record toggle"

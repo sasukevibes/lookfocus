@@ -1,5 +1,5 @@
 //! Runtime state that survives restarts: the adaptive centroids and gestures
-//! switches, and what adaptive learning has learned so far.
+//! switches, the gesture mode, and what adaptive learning has learned so far.
 //!
 //! Lives in `$XDG_STATE_HOME/lookfocus/state.json` (usually
 //! `~/.local/state/lookfocus/`), apart from your settings, because the daemon
@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::classify::Centroid;
+use crate::config::GestureMode;
 
 pub fn state_path() -> PathBuf {
     env::var_os("XDG_STATE_HOME")
@@ -30,6 +31,9 @@ pub struct State {
     /// Gestures switched on or off at run time. `None` means use the setting
     /// in config.toml.
     pub gestures: Option<bool>,
+    /// The gesture mode chosen at run time. `None` means use the setting in
+    /// config.toml.
+    pub mode: Option<GestureMode>,
     /// The `created` stamp of the calibration the learned centroids belong
     /// to. A new calibration starts learning from scratch.
     pub calibration: String,
@@ -78,6 +82,7 @@ mod tests {
         let s = State {
             adaptive: Some(true),
             gestures: Some(true),
+            mode: Some(GestureMode::Hold),
             calibration: "2026-10-08T07:50:00".into(),
             learned: Some(vec![Centroid { monitor: "DP-1".into(), yaw: 38.0, pitch: 0.5 }]),
         };
@@ -86,6 +91,13 @@ mod tests {
         // A file from before gestures existed still loads.
         std::fs::write(&path, r#"{"adaptive":true,"calibration":"x"}"#).unwrap();
         assert_eq!(State::load(&path).gestures, None);
+        // And one from before the gesture mode existed.
+        std::fs::write(&path, r#"{"adaptive":true,"gestures":true,"calibration":"x"}"#).unwrap();
+        let old = State::load(&path);
+        assert_eq!((old.gestures, old.mode), (Some(true), None));
+        // The mode is saved by name.
+        s.save(&path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains(r#""mode": "hold""#));
         s.save(&path).unwrap();
         assert!(s.learned_for("2026-10-08T07:50:00").is_some());
         assert!(s.learned_for("another calibration").is_none());

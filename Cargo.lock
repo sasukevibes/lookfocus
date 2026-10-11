@@ -438,6 +438,7 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
+ "libc",
  "log",
  "nalgebra",
  "ort",

@@ -7,10 +7,16 @@
 //! zombie. A command that cannot start, or exits with an error, is logged and
 //! otherwise ignored.
 //!
+//! The one time the daemon does wait is when it shuts down, so a hold's stop
+//! command gets to finish before systemd ends what is left of the service.
+//!
 //! The daemon talks to the `ActionRunner` trait, and tests give it a fake one.
 
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -20,24 +26,47 @@ pub trait ActionRunner {
     /// Starts `command` for `gesture` and returns without waiting for it.
     /// An error means it could not be started.
     fn run(&mut self, gesture: Gesture, command: &str) -> Result<()>;
+
+    /// Waits up to `timeout` for the commands started so far to finish.
+    /// Returns true if they all did.
+    fn wait(&mut self, timeout: Duration) -> bool;
 }
 
 /// Runs commands with `sh -c`.
-pub struct ShellRunner;
+#[derive(Default)]
+pub struct ShellRunner {
+    /// Commands started and not yet finished.
+    running: Arc<AtomicUsize>,
+}
 
 impl ActionRunner for ShellRunner {
     fn run(&mut self, gesture: Gesture, command: &str) -> Result<()> {
         let child = spawn(command)?;
         let owned = command.to_string();
-        std::thread::Builder::new()
-            .name("action".into())
-            .spawn(move || {
-                if let Some(problem) = wait_and_describe(child) {
-                    log::warn!("the {gesture} command `{owned}` {problem}");
-                }
-            })
-            .context("could not start a thread to wait for the command")?;
+        let running = self.running.clone();
+        running.fetch_add(1, Ordering::SeqCst);
+        let waiter = std::thread::Builder::new().name("action".into()).spawn(move || {
+            if let Some(problem) = wait_and_describe(child) {
+                log::warn!("the {gesture} command `{owned}` {problem}");
+            }
+            running.fetch_sub(1, Ordering::SeqCst);
+        });
+        if waiter.is_err() {
+            self.running.fetch_sub(1, Ordering::SeqCst);
+        }
+        waiter.context("could not start a thread to wait for the command")?;
         Ok(())
+    }
+
+    fn wait(&mut self, timeout: Duration) -> bool {
+        let until = Instant::now() + timeout;
+        while self.running.load(Ordering::SeqCst) > 0 {
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
     }
 }
 
@@ -87,7 +116,6 @@ fn hint(code: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("lookfocus-actions-{name}-{}", std::process::id()));
@@ -114,7 +142,7 @@ mod tests {
         // sure `run` returns before the command is done.
         let command = format!("sleep 0.3; echo \"$((40 + 2))\" | cat > {}", marker.display());
         let started = Instant::now();
-        ShellRunner.run(Gesture::OpenPalm, &command).unwrap();
+        ShellRunner::default().run(Gesture::OpenPalm, &command).unwrap();
         assert!(started.elapsed() < Duration::from_millis(250), "run waited for the command");
         assert!(wait_for(&marker));
         let until = Instant::now() + Duration::from_secs(5);
@@ -122,6 +150,19 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "42\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wait_lets_started_commands_finish() {
+        let dir = scratch("wait");
+        let marker = dir.join("marker");
+        let mut runner = ShellRunner::default();
+        assert!(runner.wait(Duration::ZERO), "nothing to wait for");
+        runner.run(Gesture::OpenPalm, &format!("sleep 0.3; touch {}", marker.display())).unwrap();
+        assert!(!runner.wait(Duration::from_millis(50)), "gave up before it finished");
+        assert!(runner.wait(Duration::from_secs(10)));
+        assert!(marker.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
