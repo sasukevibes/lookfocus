@@ -56,7 +56,10 @@ Each line is one JSON object with an `event` field.
 | `camera_unavailable` | `reason` | The camera could not be opened |
 | `adaptive_changed` | `enabled` | Adaptive centroids were switched on or off |
 | `gestures_changed` | `enabled` | Hand gestures were switched on or off |
-| `gesture` | `gesture`, `command` | A hand gesture was held long enough to count. `gesture` is its name (`open_palm`). `command` is the shell command lookfocus ran for it, or `null` if none is set |
+| `gesture` | `gesture`, `command` | Toggle mode: a hand gesture was held long enough to count. `gesture` is its name (`open_palm`). `command` is the shell command lookfocus ran for it, or `null` if none is set |
+| `gesture_started` | `gesture`, `command` | Hold mode: a hold started. `command` is the `start` command lookfocus ran, or `null` if none is set |
+| `gesture_ended` | `gesture`, `command`, `reason` | Hold mode: a hold ended. `command` is the `stop` command lookfocus ran, or `null`. `reason` is `released` when the gesture was gone for `release_ms`, or what ended it early: `camera_closed`, `away`, `gestures_off`, `mode_changed`, `reload` or `shutdown` |
+| `gesture_mode_changed` | `mode` | The gesture mode was switched to `toggle` or `hold` |
 
 Example:
 
@@ -65,7 +68,13 @@ Example:
 {"event":"switched","from":"DP-2","to":"eDP-2"}
 {"event":"paused","reason":"paused"}
 {"event":"gesture","gesture":"open_palm","command":"voxtype record toggle"}
+{"event":"gesture_mode_changed","mode":"hold"}
+{"event":"gesture_started","gesture":"open_palm","command":"voxtype record start"}
+{"event":"gesture_ended","gesture":"open_palm","command":"voxtype record stop","reason":"released"}
 ```
+
+Every `gesture_started` is followed by exactly one `gesture_ended`, as long as
+the daemon is not killed outright.
 
 The `gesture` event is sent when the gesture fires, so a tool that only wants to
 react to gestures can use it and leave `command` empty in `config.toml`:
@@ -85,6 +94,7 @@ line. The CLI uses these:
 | `pause`, `resume`, `toggle` | Status after the change |
 | `adaptive on`, `adaptive off`, `adaptive toggle`, `adaptive reset` | Status after the change |
 | `gestures on`, `gestures off`, `gestures toggle` | Status after the change |
+| `gestures mode hold`, `gestures mode toggle` | Status after the change. `status` has `gesture_mode` (`toggle` or `hold`) and `holding` (a hold is on) |
 | `reload` | Status after reading `calibration.toml` again |
 
 ## Design notes

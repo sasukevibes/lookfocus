@@ -3,6 +3,22 @@
 A running log of decisions, verified facts, and open questions. Newest phase at
 the top of each section. The project brief is in `docs/SPEC.md`.
 
+## Gesture hold mode (2026-10-11, not yet compiled or run on a camera)
+
+Written in a sandbox with no crates, so only `src/trigger.rs` was compiled
+and tested (on its own, with `rustc --test`). Run `cargo test` first.
+
+To check on the first real run:
+
+- `lookfocus gestures mode hold`, hold up a palm: `voxtype record start` after
+  about 0.4 s, `voxtype record stop` half a second after lowering it.
+- That `release_ms = 500` rides out the hand tracker losing the palm for a
+  frame or two. If holds end with the palm still up, raise it.
+- `systemctl --user stop lookfocus` mid-hold: the log should show the hold
+  ending with reason `shutdown` and voxtype should stop. The daemon waits up to
+  3 s for the stop command before exiting, since systemd kills what is left
+  in the cgroup.
+
 ## Gesture actions (2026-10-09, not yet run on a camera)
 
 Tested with scripted samples, a fake command runner and fake time only. The

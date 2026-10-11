@@ -10,9 +10,9 @@ import qs.Ui
 //
 // Left click pauses or resumes tracking (starting the service if it is not
 // running). Right click opens a dropdown with tracking, adaptive centroids,
-// hand gestures, recalibration and the service. Everything goes through the
-// `lookfocus` CLI, the same one the keybind uses, so the bar never talks to
-// the daemon directly.
+// hand gestures and their mode, recalibration and the service. Everything
+// goes through the `lookfocus` CLI, the same one the keybind uses, so the bar
+// never talks to the daemon directly.
 Panel {
   id: root
   moduleName: "sasukevibes.lookfocus"
@@ -21,11 +21,13 @@ Panel {
   implicitHeight: Style.bar.sizeHorizontal
 
   // `lookfocus status --json`, or a placeholder until the first answer.
-  property var status: ({ running: false, state: "unknown", adaptive: false, gestures: false, gesture: null, drift: [] })
+  property var status: ({ running: false, state: "unknown", adaptive: false, gestures: false, gesture: null,
+    gesture_mode: "toggle", holding: false, drift: [] })
   property bool cliMissing: false
 
   readonly property string stateName: String(status.state || "unknown")
   readonly property bool running: !!status.running
+  readonly property bool holdMode: status.gesture_mode === "hold"
   readonly property bool tracking: stateName === "tracking" || stateName === "away"
   readonly property bool problem: stateName === "layout_changed" || stateName === "camera_unavailable"
     || stateName === "not_calibrated" || cliMissing
@@ -83,6 +85,12 @@ Panel {
     if (!status.gestures) return "Hold up a hand to run a command"
     var seeing = status.gesture ? " · seeing " + String(status.gesture).replace(/_/g, " ") : ""
     return "Camera stays open, even while paused" + seeing
+  }
+
+  function holdText() {
+    if (!holdMode) return "Off · holding up a palm runs its command once (toggles dictation)"
+    if (status.holding) return "Holding · lower your palm to run the stop command"
+    return "On · start runs while you hold up a palm, stop when you lower it"
   }
 
   function tip() {
@@ -190,6 +198,14 @@ Panel {
         description: root.gesturesText()
         checked: !!root.status.gestures
         onClicked: root.run(["gestures", "toggle"])
+      }
+
+      Toggle {
+        width: parent.width
+        label: "Hold to talk"
+        description: root.holdText()
+        checked: root.holdMode
+        onClicked: root.run(["gestures", "mode", root.holdMode ? "toggle" : "hold"])
       }
 
       PanelSeparator {}

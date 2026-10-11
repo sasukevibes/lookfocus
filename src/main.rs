@@ -1,5 +1,6 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -9,7 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use lookfocus::calibrate::{self, Plan, Prompter};
 use lookfocus::camera::V4lCamera;
 use lookfocus::classify::Classifier;
-use lookfocus::config::{CALIBRATION_FILE, Calibration, SETTINGS_FILE, Settings, config_dir};
+use lookfocus::config::{CALIBRATION_FILE, Calibration, GestureMode, SETTINGS_FILE, Settings, config_dir};
 use lookfocus::control::{self, Status};
 use lookfocus::daemon::Daemon;
 use lookfocus::events::Event;
@@ -64,7 +65,7 @@ enum Command {
     },
     /// Switch hand gestures, which run a command when you hold a hand up.
     Gestures {
-        #[arg(value_enum)]
+        #[command(subcommand)]
         action: GesturesAction,
     },
     /// Stream events as JSON lines (experimental).
@@ -100,19 +101,45 @@ impl AdaptiveAction {
     }
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, Subcommand)]
 enum GesturesAction {
+    /// Switch gestures on.
     On,
+    /// Switch gestures off.
     Off,
+    /// Switch gestures on if off, off if on.
+    Toggle,
+    /// Choose what holding a gesture does.
+    Mode {
+        #[arg(value_enum)]
+        mode: ModeArg,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ModeArg {
+    /// Hold to talk: the start command runs while you hold, the stop command when you let go.
+    Hold,
+    /// Holding runs the command once.
     Toggle,
 }
 
+impl From<ModeArg> for GestureMode {
+    fn from(m: ModeArg) -> Self {
+        match m {
+            ModeArg::Hold => GestureMode::Hold,
+            ModeArg::Toggle => GestureMode::Toggle,
+        }
+    }
+}
+
 impl GesturesAction {
-    fn word(self) -> &'static str {
+    fn words(self) -> String {
         match self {
-            GesturesAction::On => "on",
-            GesturesAction::Off => "off",
-            GesturesAction::Toggle => "toggle",
+            GesturesAction::On => "on".into(),
+            GesturesAction::Off => "off".into(),
+            GesturesAction::Toggle => "toggle".into(),
+            GesturesAction::Mode { mode } => format!("mode {}", GestureMode::from(mode)),
         }
     }
 }
@@ -235,8 +262,9 @@ fn print_status(s: &Status) {
         if s.adaptive { "on" } else { "off" },
         if drift.is_empty() { String::new() } else { format!(" (learned: {})", drift.join(", ")) }
     );
-    let seeing = s.gesture.map(|g| format!(" (seeing {g})")).unwrap_or_default();
-    println!("  gestures {}{seeing}", if s.gestures { "on" } else { "off" });
+    let seeing = s.gesture.map(|g| format!(", seeing {g}")).unwrap_or_default();
+    let holding = if s.holding { ", holding" } else { "" };
+    println!("  gestures {} ({} mode{holding}{seeing})", if s.gestures { "on" } else { "off" }, s.gesture_mode);
 }
 
 /// Status when the daemon is not running, so the bar can still show
@@ -259,6 +287,8 @@ fn stopped_status(settings: &Settings) -> Status {
         adaptive: state.adaptive.unwrap_or(settings.adaptive.enabled),
         gestures: state.gestures.unwrap_or(settings.gestures.enabled),
         gesture: None,
+        gesture_mode: state.mode.unwrap_or(settings.gestures.mode),
+        holding: false,
         mouse_hold: false,
         drift: Vec::new(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -316,7 +346,7 @@ fn adaptive(settings: &Settings, action: AdaptiveAction) -> Result<()> {
 
 fn gestures(settings: &Settings, action: GesturesAction) -> Result<()> {
     if daemon_running() {
-        print_status(&daemon_request(&format!("gestures {}", action.word()))?);
+        print_status(&daemon_request(&format!("gestures {}", action.words()))?);
         return Ok(());
     }
     // Not running: change the saved switch so the next start uses it.
@@ -327,6 +357,13 @@ fn gestures(settings: &Settings, action: GesturesAction) -> Result<()> {
         GesturesAction::On => true,
         GesturesAction::Off => false,
         GesturesAction::Toggle => !current,
+        GesturesAction::Mode { mode } => {
+            let mode = GestureMode::from(mode);
+            state.mode = Some(mode);
+            state.save(&path)?;
+            println!("gesture mode {mode} (applies when lookfocus starts)");
+            return Ok(());
+        }
     };
     state.gestures = Some(on);
     state.save(&path)?;
@@ -519,6 +556,26 @@ fn now_iso() -> String {
 
 // ---------------------------------------------------------------- run
 
+/// Set by SIGTERM (systemd stopping the service), SIGINT (Ctrl+C) or SIGHUP.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_stop_signal(_: libc::c_int) {
+    // Only an atomic store: anything more is not safe in a signal handler.
+    STOP.store(true, Ordering::SeqCst);
+}
+
+/// Makes the stop signals set `STOP` instead of killing the process, so the
+/// daemon can end a gesture hold before it exits.
+fn catch_stop_signals() {
+    let handler: extern "C" fn(libc::c_int) = on_stop_signal;
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: the handler only stores to an atomic.
+        unsafe {
+            libc::signal(signal, handler as libc::sighandler_t);
+        }
+    }
+}
+
 fn config_error(e: anyhow::Error) -> ! {
     eprintln!("Error: {e:#}");
     std::process::exit(EXIT_CONFIG);
@@ -570,7 +627,8 @@ fn run(settings: Settings) -> Result<()> {
     });
 
     log::info!("lookfocus {} running", env!("CARGO_PKG_VERSION"));
-    daemon.run(hypr_events, control::serve(listener))
+    catch_stop_signals();
+    daemon.run(hypr_events, control::serve(listener), &STOP)
 }
 
 // ---------------------------------------------------------------- debug

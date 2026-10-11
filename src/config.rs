@@ -111,7 +111,16 @@ pub struct GestureSettings {
     pub require_face: bool,
     /// The shell command to run for each gesture, by gesture name. A gesture
     /// with no entry, or an empty one, does nothing but send an event.
+    /// Used in toggle mode.
     pub actions: BTreeMap<Gesture, String>,
+    /// What holding a gesture does. The bar menu and `lookfocus gestures mode`
+    /// can switch this at run time, which overrides this value.
+    pub mode: GestureMode,
+    /// In hold mode, how long the gesture must be gone before the hold ends.
+    pub release_ms: u64,
+    /// The commands to run when a hold starts and ends, by gesture name. Used
+    /// in hold mode.
+    pub hold_actions: BTreeMap<Gesture, HoldAction>,
 }
 
 impl Default for GestureSettings {
@@ -122,8 +131,50 @@ impl Default for GestureSettings {
             cooldown_ms: 1500,
             require_face: true,
             actions: BTreeMap::from([(Gesture::OpenPalm, "voxtype record toggle".to_string())]),
+            mode: GestureMode::Toggle,
+            release_ms: 500,
+            hold_actions: BTreeMap::from([(
+                Gesture::OpenPalm,
+                HoldAction { start: "voxtype record start".into(), stop: "voxtype record stop".into() },
+            )]),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GestureMode {
+    /// Holding a gesture runs its command once (`actions`).
+    #[default]
+    Toggle,
+    /// Hold to talk: holding a gesture runs its start command, and letting go
+    /// runs its stop command (`hold_actions`).
+    Hold,
+}
+
+impl GestureMode {
+    /// The name used in config files, commands, events and status.
+    pub fn name(self) -> &'static str {
+        match self {
+            GestureMode::Toggle => "toggle",
+            GestureMode::Hold => "hold",
+        }
+    }
+}
+
+impl std::fmt::Display for GestureMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The two commands for a gesture in hold mode. Both must be given, so a
+/// start is never left without its stop. An empty one does nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HoldAction {
+    pub start: String,
+    pub stop: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -402,6 +453,47 @@ mod tests {
         let err = toml::from_str::<Settings>("[gestures.actions]\nopen_palms = \"x\"\n").unwrap_err();
         assert!(err.to_string().contains("open_palms"), "{err}");
         assert!(toml::from_str::<Settings>("[gestures.actions]\nopen_palm = 3\n").is_err());
+    }
+
+    #[test]
+    fn hold_mode_settings_default_and_parse() {
+        let g = GestureSettings::default();
+        assert_eq!((g.mode, g.release_ms), (GestureMode::Toggle, 500));
+        assert_eq!(
+            g.hold_actions.get(&Gesture::OpenPalm),
+            Some(&HoldAction { start: "voxtype record start".into(), stop: "voxtype record stop".into() })
+        );
+
+        let s: Settings = toml::from_str(
+            "[gestures]\nmode = \"hold\"\nrelease_ms = 800\n\
+             [gestures.hold_actions.open_palm]\nstart = \"rec on\"\nstop = \"rec off\"\n",
+        )
+        .unwrap();
+        assert_eq!((s.gestures.mode, s.gestures.release_ms), (GestureMode::Hold, 800));
+        assert_eq!(
+            s.gestures.hold_actions[&Gesture::OpenPalm],
+            HoldAction { start: "rec on".into(), stop: "rec off".into() }
+        );
+        // The toggle mode action is untouched.
+        assert_eq!(s.gestures.actions, GestureSettings::default().actions);
+
+        let s: Settings = toml::from_str("[gestures]\nmode = \"toggle\"\n").unwrap();
+        assert_eq!(s.gestures.mode, GestureMode::Toggle);
+        assert_eq!(s.gestures.hold_actions, GestureSettings::default().hold_actions);
+    }
+
+    #[test]
+    fn hold_mode_settings_reject_mistakes() {
+        assert!(toml::from_str::<Settings>("[gestures]\nmode = \"push\"\n").is_err());
+        assert!(toml::from_str::<Settings>("[gestures]\nmode = \"Hold\"\n").is_err());
+        assert!(toml::from_str::<Settings>("[gestures]\nrelease = 500\n").is_err());
+        // A start without a stop could leave a recording running.
+        assert!(toml::from_str::<Settings>("[gestures.hold_actions.open_palm]\nstart = \"x\"\n").is_err());
+        assert!(
+            toml::from_str::<Settings>("[gestures.hold_actions.open_palm]\nstart = \"x\"\nstop = \"y\"\nend = \"z\"\n")
+                .is_err()
+        );
+        assert!(toml::from_str::<Settings>("[gestures.hold_actions.fist]\nstart = \"x\"\nstop = \"y\"\n").is_err());
     }
 
     #[test]
